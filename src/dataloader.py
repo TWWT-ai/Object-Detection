@@ -1,14 +1,30 @@
 import torch as th
-from torch.utils.data import Dataset
-import os
+from torch.utils.data import DataLoader
 import PIL.Image as Image
-import csv
-from typing import Callable, Optional, Tuple, Union, List
-import xml.etree.ElementTree as ET
-from typing import Dict, List, Tuple
 import pathlib
 import numpy as np
 import cv2
+
+def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0):
+    root = pathlib.Path(root)
+    persons = sorted(p.name for p in root.iterdir() if p.is_dir())
+
+    # Selecting people to load
+    rng = np.random.default_rng(seed)
+    rng.shuffle(persons)
+    val_ids = set(persons[:n_val_persons:])
+    train_ids = set(persons[n_val_persons:])
+    print(f"val persons: {sorted(val_ids)}")
+
+    # Datasets
+    train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_depth=True)
+    val_ds = HandGestureDataset(root, person_ids=val_ids, augment=False, use_depth=True)
+
+    # Loading Data
+    train_loader = DataLoader(train_ds, batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    return train_loader, val_loader
 
 class HandGestureDataset():
     def __init__(self, root, person_ids=None, transform=None, augment=False, use_flip=False, use_depth=False):
@@ -134,8 +150,4 @@ class HandGestureDataset():
                 "Boundary_Box": th.from_numpy(boundary_box),
                 "Label": s["Label"]
                 }
-        
-
-    def get_dataloader(self):
-        pass
 
