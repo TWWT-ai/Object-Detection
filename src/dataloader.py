@@ -74,7 +74,20 @@ class HandGestureDataset():
 
         label = s["Label"]
         
-        
+        # Resizing all three images, image size is (width, height)
+        rgb = cv2.resize(rgb, (self.IMAGE_SIZE, self.IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
+        depth = cv2.resize(depth, (self.IMAGE_SIZE, self.IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, (self.IMAGE_SIZE, self.IMAGE_SIZE), interpolation=cv2.INTER_NEAREST)
+
+        # Measuring the boundary box after resized
+        rows, cols = np.where(mask==1)
+        if len(rows) == 0:
+            raise ValueError(f"The mask is empty: {s["Mask"]}")
+
+        # x_min, y_min, x_max, y_max
+        boundary_box = np.array([cols.min(), rows.min(), cols.max(), rows.max()], dtype=np.float32)
+        # Normalizing and simplifying steps for YOLO endocing later
+        boundary_box = boundary_box / self.IMAGE_SIZE
 
     def get_dataloader(self):
         pass
