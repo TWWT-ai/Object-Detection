@@ -59,7 +59,22 @@ class HandGestureDataset():
 
 
     def __getitem__(self, index):
-        pass
+        # Read file at position index
+        s = self.samples[index]
+
+        # 1. RGB into numpy
+        rgb = np.array(Image.open(s["RGB"]).convert("RGB"))
+
+        # 2. Depth into numpy
+        depth = np.load(s["Depth"]).astype(np.float32)
+
+        # 3. Mask into binary mask
+        mask = np.array(Image.open(s["Mask"]).convert("L"))  # "L" means grey scale (0 - 255)
+        mask = (mask > 127).astype(np.float32)               # separating hand (> 127) and background
+
+        label = s["Label"]
+        
+        
 
     def get_dataloader(self):
         pass
