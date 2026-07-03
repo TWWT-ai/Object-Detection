@@ -11,9 +11,12 @@ import numpy as np
 import cv2
 
 class HandGestureDataset():
-    def __init__(self, root, person_ids=None, transform=None):
+    def __init__(self, root, person_ids=None, transform=None, augment=False, use_flip=False, use_depth=False):
         self.root = pathlib.Path(root)
         self.transform = transform
+        self.augment = augment
+        self.use_flip = use_flip
+        self.use_depth = use_depth
         self.samples = []
         self.IMAGE_SIZE = 448
 
@@ -84,10 +87,24 @@ class HandGestureDataset():
         if len(rows) == 0:
             raise ValueError(f"The mask is empty: {s["Mask"]}")
 
+        # Augmentation preventing overfitting forced to train
+        if self.augment:
+            # Horizontal flip
+            if self.use_flip and np.random.rand() < 0.5:
+                rgb = rgb[:, ::-1].copy()
+                depth = depth[:, ::-1].copy()
+                mask = mask[:, ::-1].copy()
+
+            # Adjusting brightness
+            if np.random.rand() < 0.5:
+                factor = np.random.uniform(0.7, 1.3)
+                rgb = np.clip(rgb.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+
         # x_min, y_min, x_max, y_max
         boundary_box = np.array([cols.min(), rows.min(), cols.max(), rows.max()], dtype=np.float32)
         # Normalizing and simplifying steps for YOLO endocing later
         boundary_box = boundary_box / self.IMAGE_SIZE
+
 
     def get_dataloader(self):
         pass
