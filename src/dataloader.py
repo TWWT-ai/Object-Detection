@@ -105,6 +105,36 @@ class HandGestureDataset():
         # Normalizing and simplifying steps for YOLO endocing later
         boundary_box = boundary_box / self.IMAGE_SIZE
 
+        # Normalizing RGB
+        rgb = rgb.astype(np.float32) / 255.0
+
+        # Imputation with median
+        valid = depth > 0
+        if valid.any():
+            depth[~valid] = np.median(depth[valid])
+
+        # Normalizing depth
+        depth = np.clip(depth, 0, 1500) / 1500.0
+
+        # Transforming it into 3D matrix to match RGB
+        # Then having a matrix with info of [R, G, B, depth]
+        if self.use_depth:
+            image = np.concatenate([rgb, depth[..., None]], axis=-1)
+        else:
+            image = rgb
+
+        # Packing into what pytorch would expect
+        # permute() converts into [channel, height, width], what nn.Conv2d expects
+        # unsqueeze() would insert 1 at index 0 to fit the size
+        image = th.from_numpy(image).permute(2, 0, 1).float()
+        mask = th.from_numpy(mask).unsqueeze(0).float()
+
+        return {"Image": image,
+                "Mask": mask,
+                "Boundary_Box": th.from_numpy(boundary_box),
+                "Label": s["Label"]
+                }
+        
 
     def get_dataloader(self):
         pass
