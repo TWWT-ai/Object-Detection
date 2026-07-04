@@ -1,5 +1,6 @@
 import torch as th
 import torch.nn as nn
+import torch.nn.functional as F
 
 def conv_block(channel_in, channel_out, k=3, s=1):
     # s=1 only thickening, s=2 shrinking and thickening
@@ -53,6 +54,19 @@ class DetectionHead(nn.Module):
         return output.permute(0, 2, 3, 1)   # Number is the index
 
 
+class ClassificationHead(nn.Module):
+    def __init__(self, n_classes=10):
+        super().__init__()
+        # To classify which sign is the possible class we want (returns logit)
+        self.fc = nn.Linear(1024, n_classes)
+
+
+    def forward(self, f7):
+        # Extracting from each block whether is contains the object
+        v = F.adaptive_avg_pool2d(f7, 1).flatten(1)
+        return self.fc(v)
+    
+    
 class SegmentationHead(nn.Module):
     def __init__(self):
         pass
