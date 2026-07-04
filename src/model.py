@@ -23,6 +23,7 @@ class Backbone(nn.Module):
         self.s5 = nn.Sequential(conv_block(256, 512, s=2), conv_block(512, 512))
         self.s6 = nn.Sequential(conv_block(512, 1024, s=2), conv_block(1024, 1024))
 
+
     def forward(self, x):
         # Forward pass to get data from size 7 to 56 and later hand to SegmentationHead to help to classify the border
         # Mainly using s3 to s5 to calibrate the shape, therefore keeping the record all these data and ready to share backbone
@@ -33,10 +34,25 @@ class Backbone(nn.Module):
         return f56, f28, f14, f7
 
 
-
 class DetectionHead(nn.Module):
-    def __init__(self):
-        pass
+    def __init__(self, B=2):
+        super().__init__()
+        self.B = B
+        self.net = nn.Sequential(
+            # Reforming 1024 of data into 512 constructed with newly mixed weights with lower weights become negligible
+            conv_block(1024, 512), 
+            # To determine the frame that actually lands on what we want
+            # Candidate box(possible box containing the object) * (x, y, w, h, conf) = B * 5
+            nn.Conv2d(512, B * 5, kernel_size=1) 
+        )
+
+
+    def forward(self, f7):
+        output = self.net(f7)
+        # Convert back to the form which torch expects (batch, channel, height, width), (batch, 7, 7, 10)
+        return output.permute(0, 2, 3, 1)   # Number is the index
+
+
 class SegmentationHead(nn.Module):
     def __init__(self):
         pass
