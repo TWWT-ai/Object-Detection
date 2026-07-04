@@ -93,5 +93,17 @@ class SegmentationHead(nn.Module):
     
 
 class HandGestureNet(nn.Module):
-    def __init__(self):
-        pass
+    def __init__(self, in_channels=5, n_classes=10, B=2):
+        super().__init__()
+        self.backbone = Backbone(in_channels)
+        self.detecting_head = DetectionHead(B)
+        self.classification_head = ClassificationHead(n_classes)
+        self.segmentation_head = SegmentationHead()
+
+    
+    def forward(self, x):
+        f56, f28, f14, f7 = self.backbone(x)
+        return (self.detecting_head(f7),
+                self.segmentation_head(f56, f28, f14, f7),
+                self.classification_head(f7)
+                )
