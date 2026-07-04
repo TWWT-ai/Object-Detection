@@ -68,8 +68,30 @@ class ClassificationHead(nn.Module):
     
     
 class SegmentationHead(nn.Module):
+    # Resizing back to input image size with suitable correction and modification
     def __init__(self):
-        pass
+        super().__init__()
+        # Sticking back the channels
+        self.up1 = conv_block(1024 + 512, 256)
+        self.up2 = conv_block(256 + 256, 128)
+        self.up3 = conv_block(128 + 128, 64)
+        # Converting the all 64 weight per pixel into one number
+        self.out = nn.Conv2d(64, 1, kernel_size=1)
+
+
+    def forward(self, f56, f28, f14, f7):
+        # Enlarging by scale factor 2
+        x = F.interpolate(f7, scale_factor=2)
+        # Following the channel(dimension 1) extend on it e.g. 1025 + 512 = 1536
+        x = self.up1(th.cat([x, f14], dim=1))
+        x = F.interpolate(x, scale_factor=2)
+        x = self.up2(th.cat([x, f28], dim=1))
+        x = F.interpolate(x, scale_factor=2)
+        x = self.up3(th.cat([x, f56], dim=1))
+        x = F.interpolate(x, size=(448, 448), mode="bilinear", align_corners=False)
+        return self.out(x)
+    
+
 class HandGestureNet(nn.Module):
     def __init__(self):
         pass
