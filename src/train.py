@@ -98,6 +98,78 @@ def compute_loss(outputs, targets, segmentation_criterion, classification_criter
     return total, losses
 
 
-def train_one_epoch():
-    pass
+#---------------------------------------------------
+# Train and validation
+#---------------------------------------------------
 
+def train_one_epoch(model, loader, optimizer, segmentation_criterion, 
+                    classification_criterion, device, lambda_segmentation, 
+                    lambda_classification):
+    model.train()
+    running = {"det": 0.0, 
+              "seg": 0.0,
+              "cls": 0.0, 
+              "total": 0.0
+              }
+    
+    for images, targets in loader:
+        # Copying what is on CPU onto GPU (RAM to VRAM)
+        images = images.to(device)
+        targets = {k: v.to(device) for k, v in targets.items()}
+
+        # Computing loss for each image
+        outputs = model(images)
+        loss, parts = compute_loss(outputs, targets, segmentation_criterion,
+                                   classification_criterion, device, lambda_segmentation,
+                                   lambda_classification)
+        
+        # Cleaning the previously loaded data first
+        optimizer.zero_grad()
+        # The chain rule part, this tells you on which way you should adjust the direction
+        # dloss/dw = dloss/dy * dy/dz * dz/dw
+        loss.backward()
+        # Using Adam formula to update the and override the old data
+        optimizer.step()
+
+        # Adding the loss to the training model
+        for k in running:
+            running[k] += parts[k]
+
+    n = len(loader)
+    return {k: v / n for k, v in targets.items()}
+
+
+def validate(model, loader, segmentation_criterion, 
+            classification_criterion, device, lambda_segmentation, 
+            lambda_classification):
+    model.eval()
+    running = {"det": 0.0, 
+              "seg": 0.0,
+              "cls": 0.0, 
+              "total": 0.0
+              }
+    correct, total_samples = 0, 0
+
+    for images, targets in loader:
+        # Copying what is on CPU onto GPU (RAM to VRAM)
+        images = images.to(device)
+        targets = {k: v.to(device) for k, v in targets.items()}
+
+        outputs = model(images)
+        _, parts = compute_loss(outputs, targets, segmentation_criterion,
+                                   classification_criterion, device, lambda_segmentation,
+                                   lambda_classification)
+        
+        # Adding the loss to the training model
+        for k in running:
+            running[k] += parts[k]
+
+        # Classification accurancy 
+        pred_label = outputs[2].argmax(dim=1)
+        correct += (pred_label == targets["Label"]).sum().item()
+        total_samples += images.size(0)
+
+    n = len(loader)
+    metrics = {k: v / n for k, v in running.items()}
+    metrics["cls_acc"] = correct / total_samples
+    return metrics
