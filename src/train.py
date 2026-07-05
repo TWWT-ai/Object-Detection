@@ -11,6 +11,7 @@ S = 7
 #---------------------------------------------------
 # Loss Function
 #---------------------------------------------------
+
 def compute_intersection_over_union(box1, box2):
     # Computing left and right boundary for both boxes (cx, cy, w, h)
     b1_x1, b1_y1 = box1[..., 0] - box1[..., 2] / 2, box1[..., 1] - box1[..., 3] / 2         # left bound
@@ -25,6 +26,7 @@ def compute_intersection_over_union(box1, box2):
     # Calculating union
     union = box1[..., 2] * box1[..., 3] + box2[..., 2] * box2[..., 3] - inter
     return inter / (union + 1e-6)
+
 
 def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=0.5):
     """
@@ -76,6 +78,7 @@ def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=
 
     # Returning Multi Part loss function
     return (lambda_coord * (loss_xy + loss_wh) + loss_confidence + lambda_noobj * loss_no_object) / N
+
 
 def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0):
     # Computing loss function for each Head defined in models
