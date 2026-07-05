@@ -141,7 +141,7 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
     n = len(loader)
     return {k: v / n for k, v in targets.items()}
 
-
+@th.no_grad()
 def validate(model, loader, segmentation_criterion, 
             classification_criterion, device, lambda_segmentation, 
             lambda_classification):
