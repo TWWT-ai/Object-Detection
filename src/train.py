@@ -1,6 +1,9 @@
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+import argparse
+from torch.utils.data import DataLoader
+from pathlib import Path
 
 from dataloader import HandGestureDataset
 from model import HandGestureNet
@@ -173,3 +176,84 @@ def validate(model, loader, segmentation_criterion,
     metrics = {k: v / n for k, v in running.items()}
     metrics["cls_acc"] = correct / total_samples
     return metrics
+
+
+#---------------------------------------------------
+# Main method
+#---------------------------------------------------
+
+def main():
+    # Like creating an empty sheet with all the data we are tracking
+    parser = argparse.ArgumentParser(description="Train HandGestureNet (CW1)")
+    parser.add_argument("--data-root", type=str, default="data/")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--lambda-seg", type=float, default=1.0)
+    parser.add_argument("--lambda-cls", type=float, default=1.0)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--out-dir", type=str, default="weights/")
+    parser.add_argument("--seed", type=int, default=42)
+    # Pack all the top argument into one
+    args = parser.parse_args()
+
+    # Keeping the training sample set the same every training at the start
+    th.manual_seed(args.seed)
+    # Selecting the available GPU device
+    device = th.device("cuda" if th.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Splitting data
+    train_set = HandGestureDataset(args.data_root, split="train")
+    validation_set = HandGestureDataset(args.data_root, split="val")
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, 
+                                num_workers=args.num_workers, pin_memory=True)
+    validation_loader = DataLoader(validation_set, batch_size=args.batch_size, shuffle=False, 
+                                num_workers=args.num_workers, pin_memory=True)
+    
+    #Creating model, optimizer, loss
+    model = HandGestureNet(in_channels=4, n_classes=10, B=2).to(device)
+    segmentation_criterion = nn.BCEWithLogitsLoss()
+    classification_criterion = nn.CrossEntropyLoss()
+    optimizer = th.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    schedular = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
+    # Creating location to store the outputs
+    output_directory = Path(args.out_dir)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    best_val = float("inf")
+
+    # Training loop
+    for epoch in range(1, args.epochs + 1):
+        train_m = train_one_epoch(model, train_loader, optimizer, segmentation_criterion, 
+                                  classification_criterion, device, args.lambda_seg, args.lambda_cls)
+        val_m = train_one_epoch(model, validation_loader, optimizer, segmentation_criterion, 
+                                  classification_criterion, device, args.lambda_seg, args.lambda_cls)
+        schedular.stop()
+
+        print(f"[{epoch:03d}/{args.epochs}] "
+              f"train {train_m['total']:.4f} "
+              f"(det {train_m['det']:.3f} | seg {train_m['seg']:.3f} | cls {train_m['cls']:.3f})  "
+              f"val {val_m['total']:.4f}  cls_acc {val_m['cls_acc']:.3f}")
+
+        # Updating the best value trained 
+        if val_m["total"] < best_val:
+            best_val = val_m["total"]
+            th.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "val_loss": best_val,
+                "args": vars(args),
+            }, output_directory / "best.pth")
+            print(f"  ↳ new best (val {best_val:.4f}), checkpoint saved")
+
+    # Save the best model/value overall
+    th.save({"epoch": args.epochs, "model_state": model.state_dict()},
+               output_directory / "last.pth")
+    print("Training finished.")
+
+
+if __name__ == "__main__":
+    main()
