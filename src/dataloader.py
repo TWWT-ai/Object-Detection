@@ -2,6 +2,7 @@ import torch as th
 from torch.utils.data import DataLoader
 import PIL.Image as Image
 import pathlib
+import re
 import numpy as np
 import cv2
 from utils import encode_yolo_target
@@ -43,6 +44,7 @@ class HandGestureDataset():
         self.use_flip = use_flip
         self.use_depth = use_depth
         self.samples = []
+        self.skipped = 0
         self.IMAGE_SIZE = 448
 
         for mask_path in sorted(self.root.rglob("annotation/*png")):
@@ -59,15 +61,20 @@ class HandGestureDataset():
             # Finding the index of the gesture 
             label = int(gesture_directory.name[1:3]) - 1
 
-            # Building the path if in same folder / directory
-            rgb_path = clip_directory / "rgb" / mask_path.name
-            depth_path = clip_directory / "depth" / mask_path.name
+            # Every classmate names files differently (e.g. "frame_005.png" vs
+            # "G01_call_clip01_rgb_frame_005.png"), so match by FRAME NUMBER
+            # instead of demanding identical names
+            frame_match = re.search(r"frame_?\d+", mask_path.stem)
+            frame_id = frame_match.group(0) if frame_match else mask_path.stem
 
-            # Safety check
-            if not rgb_path.exists():
-                raise FileExistsError(f"RGB does not exists in the folder: {rgb_path}")
-            if not depth_path.exists():
-                raise FileExistsError(f"Depth does not exists in the folder: {depth_path}")
+            rgb_path = self._find_frame(clip_directory / "rgb", frame_id)
+            depth_path = self._find_frame(clip_directory / "depth", frame_id)
+
+            # Skip (and count) incomplete samples instead of crashing:
+            # one classmate's missing file should not block the whole cohort
+            if rgb_path is None or depth_path is None:
+                self.skipped += 1
+                continue
 
             # Adding into the samples
             self.samples.append({
@@ -78,8 +85,21 @@ class HandGestureDataset():
                 "Person": person_id
             })
 
+        if self.skipped:
+            print(f"WARNING: skipped {self.skipped} annotation(s) with no matching rgb/depth file")
+
         if len(self.samples) == 0:
             raise RuntimeError(f"No File found in this root: {self.root}")
+
+    @staticmethod
+    def _find_frame(folder, frame_id):
+        """Return the file in `folder` whose name contains `frame_id`, else None."""
+        if not folder.is_dir():
+            return None
+        for p in sorted(folder.iterdir()):
+            if frame_id in p.name:
+                return p
+        return None
             
 
     def __len__(self):
@@ -93,8 +113,13 @@ class HandGestureDataset():
         # 1. RGB into numpy
         rgb = np.array(Image.open(s["RGB"]).convert("RGB"))
 
-        # 2. Depth into numpy
-        depth = cv2.imread(str(s["Depth"]), cv2.IMREAD_UNCHANGED).astype(np.float32)
+        # 2. Depth into numpy — classmates exported different formats
+        if s["Depth"].suffix == ".npy":
+            depth = np.load(s["Depth"]).astype(np.float32)
+        else:
+            depth = cv2.imread(str(s["Depth"]), cv2.IMREAD_UNCHANGED).astype(np.float32)
+        if depth.ndim == 3:
+            depth = depth[..., 0]      # some exports save depth as 3-channel
 
         # 3. Mask into binary mask
         mask = np.array(Image.open(s["Mask"]).convert("L"))  # "L" means grey scale (0 - 255)
@@ -141,8 +166,12 @@ class HandGestureDataset():
         if valid.any():
             depth[~valid] = np.median(depth[valid])
 
-        # Normalizing depth
-        depth = np.clip(depth, 0, 1500) / 1500.0
+        # Normalizing depth: the cohort exported 8-bit depth maps (0-255),
+        # keep a fallback for true 16-bit millimetre depth just in case
+        if depth.max() > 255:
+            depth = np.clip(depth, 0, 1500) / 1500.0
+        else:
+            depth = depth / 255.0
 
         # Transforming it into 3D matrix to match RGB
         # Then having a matrix with info of [R, G, B, depth]
