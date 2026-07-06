@@ -7,15 +7,22 @@ import cv2
 from utils import encode_yolo_target
 
 
-def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0):
+def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2):
     root = pathlib.Path(root)
     persons = sorted(p.name for p in root.iterdir() if p.is_dir())
 
     # Selecting people to load
     rng = np.random.default_rng(seed)
     rng.shuffle(persons)
-    val_ids = set(persons[:n_val_persons:])
+    val_ids = set(persons[:n_val_persons])
     train_ids = set(persons[n_val_persons:])
+
+    # Smoke-test fallback: too few persons to split -> everyone plays both roles
+    if len(train_ids) == 0:
+        print("WARNING: too few persons for a real split, "
+              "using ALL persons for both train and val (smoke test only)")
+        train_ids = val_ids = set(persons)
+
     print(f"val persons: {sorted(val_ids)}")
 
     # Datasets
@@ -23,8 +30,8 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0):
     val_ds = HandGestureDataset(root, person_ids=val_ids, augment=False, use_depth=True)
 
     # Loading Data
-    train_loader = DataLoader(train_ds, batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     return train_loader, val_loader
 
@@ -54,7 +61,7 @@ class HandGestureDataset():
 
             # Building the path if in same folder / directory
             rgb_path = clip_directory / "rgb" / mask_path.name
-            depth_path = clip_directory / "depth" / (mask_path.name + ".npy")
+            depth_path = clip_directory / "depth" / mask_path.name
 
             # Safety check
             if not rgb_path.exists():
@@ -87,7 +94,7 @@ class HandGestureDataset():
         rgb = np.array(Image.open(s["RGB"]).convert("RGB"))
 
         # 2. Depth into numpy
-        depth = np.load(s["Depth"]).astype(np.float32)
+        depth = cv2.imread(str(s["Depth"]), cv2.IMREAD_UNCHANGED).astype(np.float32)
 
         # 3. Mask into binary mask
         mask = np.array(Image.open(s["Mask"]).convert("L"))  # "L" means grey scale (0 - 255)
@@ -150,11 +157,13 @@ class HandGestureDataset():
         image = th.from_numpy(image).permute(2, 0, 1).float()
         mask = th.from_numpy(mask).unsqueeze(0).float()
 
-        targets = {"Image": image,
+        # Keys must match compute_loss in train.py exactly: "det", "Mask", "Label"
+        # - "det" is the encoded YOLO grid computed above (this was missing!)
+        # - image is already returned separately, no need to duplicate it here
+        targets = {"det": det_target,
                 "Mask": mask,
-                "Boundary_Box": th.from_numpy(boundary_box),
-                "Label": s["Label"]
+                "Label": th.tensor(s["Label"], dtype=th.long)
                 }
-        
+
         return image, targets
 
