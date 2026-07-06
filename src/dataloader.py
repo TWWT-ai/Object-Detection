@@ -4,6 +4,8 @@ import PIL.Image as Image
 import pathlib
 import numpy as np
 import cv2
+from utils import encode_yolo_target
+
 
 def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0):
     root = pathlib.Path(root)
@@ -44,7 +46,7 @@ class HandGestureDataset():
             person_id = person_directory.name
 
             # If the person is not in the list then pass
-            if person_id is not None and person_id not in person_ids:
+            if person_ids is not None and person_id not in person_ids:
                 continue
 
             # Finding the index of the gesture 
@@ -69,8 +71,8 @@ class HandGestureDataset():
                 "Person": person_id
             })
 
-            if len(self.samples) == 0:
-                raise RuntimeError(f"No File found in this root: {self.root}")
+        if len(self.samples) == 0:
+            raise RuntimeError(f"No File found in this root: {self.root}")
             
 
     def __len__(self):
@@ -98,11 +100,6 @@ class HandGestureDataset():
         depth = cv2.resize(depth, (self.IMAGE_SIZE, self.IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, (self.IMAGE_SIZE, self.IMAGE_SIZE), interpolation=cv2.INTER_NEAREST)
 
-        # Measuring the boundary box after resized
-        rows, cols = np.where(mask==1)
-        if len(rows) == 0:
-            raise ValueError(f"The mask is empty: {s["Mask"]}")
-
         # Augmentation preventing overfitting forced to train
         if self.augment:
             # Horizontal flip
@@ -116,10 +113,18 @@ class HandGestureDataset():
                 factor = np.random.uniform(0.7, 1.3)
                 rgb = np.clip(rgb.astype(np.float32) * factor, 0, 255).astype(np.uint8)
 
+        # Measuring the boundary box after resized
+        rows, cols = np.where(mask==1)
+        if len(rows) == 0:
+            raise ValueError(f"The mask is empty: {s['Mask']}")
+        
         # x_min, y_min, x_max, y_max
         boundary_box = np.array([cols.min(), rows.min(), cols.max(), rows.max()], dtype=np.float32)
         # Normalizing and simplifying steps for YOLO endocing later
         boundary_box = boundary_box / self.IMAGE_SIZE
+
+        # Corner box -> S x S x 5 YOLO grid, the format the loss expects
+        det_target = encode_yolo_target(boundary_box)
 
         # Normalizing RGB
         rgb = rgb.astype(np.float32) / 255.0
@@ -145,9 +150,11 @@ class HandGestureDataset():
         image = th.from_numpy(image).permute(2, 0, 1).float()
         mask = th.from_numpy(mask).unsqueeze(0).float()
 
-        return {"Image": image,
+        targets = {"Image": image,
                 "Mask": mask,
                 "Boundary_Box": th.from_numpy(boundary_box),
                 "Label": s["Label"]
                 }
+        
+        return image, targets
 
