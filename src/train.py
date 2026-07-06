@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import argparse
 from torch.utils.data import DataLoader
 from pathlib import Path
+import json
 
 from dataloader import get_dataLoaders
 from dataloader import HandGestureDataset
@@ -210,7 +211,8 @@ def main():
     output_directory = Path(args.out_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
-
+    history = {"train_total": [], "val_total": [], "cls_acc": []}
+    
     # Training loop
     for epoch in range(1, args.epochs + 1):
         train_m = train_one_epoch(model, train_loader, optimizer, segmentation_criterion, 
@@ -218,6 +220,13 @@ def main():
         val_m = validate(model, validation_loader, segmentation_criterion, 
                                   classification_criterion, device, args.lambda_seg, args.lambda_cls)
         scheduler.step()
+
+        # so the curve survives even if Colab disconnects mid-training
+        history["train_total"].append(train_m["total"])
+        history["val_total"].append(val_m["total"])
+        history["cls_acc"].append(val_m["cls_acc"])
+        with open(output_directory / "history.json", "w") as f:
+            json.dump(history, f)
 
         print(f"[{epoch:03d}/{args.epochs}] "
               f"train {train_m['total']:.4f} "
