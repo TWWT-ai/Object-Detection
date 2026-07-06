@@ -205,16 +205,7 @@ def main():
     model = HandGestureNet(in_channels=4, n_classes=10, B=2).to(device)
     segmentation_criterion = nn.BCEWithLogitsLoss()
     classification_criterion = nn.CrossEntropyLoss()
-    # Per-part learning rates: the cls head chases features that det/seg keep
-    # reshaping (moving target) — give it a 10x bigger stride so it can keep up.
-    # (Diagnosed via linear probe: frozen features reach 0.37 acc while joint
-    # training was stuck at 0.10.)
-    optimizer = th.optim.Adam([
-        {"params": model.backbone.parameters()},
-        {"params": model.detecting_head.parameters()},
-        {"params": model.segmentation_head.parameters()},
-        {"params": model.classification_head.parameters(), "lr": args.lr * 10},
-    ], lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = th.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
     # Creating location to store the outputs
