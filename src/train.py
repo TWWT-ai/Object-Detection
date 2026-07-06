@@ -179,6 +179,7 @@ def main():
     parser.add_argument("--lambda-seg", type=float, default=1.0)
     parser.add_argument("--lambda-cls", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--n-val-persons", type=int, default=5)
     parser.add_argument("--out-dir", type=str, default="weights/")
     parser.add_argument("--seed", type=int, default=42)
     # Pack all the top argument into one
