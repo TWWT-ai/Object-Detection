@@ -131,3 +131,43 @@ def print_report(m, iou_thresh=0.5):
     for r in range(m["confusion"].size(0)):
         row = " ".join(f"{v:3d}" for v in m["confusion"][r].tolist())
         print(f"G{r + 1:02d}  {row}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate HandGestureNet (CW1)")
+    parser.add_argument("--data-root", type=str, default="data/")
+    parser.add_argument("--weights", type=str, default="weights/best.pth")
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--n-val-persons", type=int, default=5)
+    parser.add_argument("--iou-thresh", type=float, default=0.5)
+    # MUST match the seed used in training, otherwise the person split
+    # changes and "validation" persons leak from the training set
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+ 
+    device = th.device("cuda" if th.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+ 
+    # Same split as training (same seed -> same val persons)
+    _, val_loader = get_dataLoaders(
+        args.data_root,
+        batch_size=args.batch_size,
+        n_val_persons=args.n_val_persons,
+        seed=args.seed,
+        num_workers=args.num_workers,
+    )
+ 
+    # Rebuild the empty model, then pour the trained weights back in
+    model = HandGestureNet(in_channels=4, n_classes=10, B=2).to(device)
+    checkpoint = th.load(args.weights, map_location=device)
+    model.load_state_dict(checkpoint["model_state"])
+    print(f"Loaded {args.weights} (epoch {checkpoint.get('epoch', '?')}, "
+          f"val_loss {checkpoint.get('val_loss', float('nan')):.4f})")
+ 
+    metrics = evaluate(model, val_loader, device, iou_thresh=args.iou_thresh)
+    print_report(metrics, iou_thresh=args.iou_thresh)
+ 
+ 
+if __name__ == "__main__":
+    main()
