@@ -69,16 +69,16 @@ def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=
     return (lambda_coord * (loss_xy + loss_wh) + loss_confidence + lambda_noobj * loss_no_object) / N
 
 
-def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0):
+def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0):
     # Computing loss function for each Head defined in models
     detection_pred, segmentation_pred, classification_pred = outputs
-    
+
     # Loss per Head
     loss_detection = yolo_detection_loss(detection_pred, targets["det"])
     loss_segmentation = segmentation_criterion(segmentation_pred, targets["Mask"].float())
     loss_classification = classification_criterion(classification_pred, targets["Label"])
 
-    total = loss_detection + lambda_seg * loss_segmentation + lambda_cls * loss_classification
+    total = lambda_det * loss_detection + lambda_seg * loss_segmentation + lambda_cls * loss_classification
     losses = {"det": loss_detection.item(), 
               "seg": loss_segmentation.item(),
               "cls": loss_classification.item(), 
@@ -91,9 +91,9 @@ def compute_loss(outputs, targets, segmentation_criterion, classification_criter
 # Train and validation
 #---------------------------------------------------
 
-def train_one_epoch(model, loader, optimizer, segmentation_criterion, 
-                    classification_criterion, device, lambda_segmentation, 
-                    lambda_classification):
+def train_one_epoch(model, loader, optimizer, segmentation_criterion,
+                    classification_criterion, device, lambda_segmentation,
+                    lambda_classification, lambda_detection=1.0):
     model.train()
     running = {"det": 0.0, 
               "seg": 0.0,
@@ -110,8 +110,8 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
         outputs = model(images)
         loss, parts = compute_loss(outputs, targets, segmentation_criterion,
                                    classification_criterion, lambda_segmentation,
-                                   lambda_classification)
-        
+                                   lambda_classification, lambda_detection)
+
         # Cleaning the previously loaded data first
         optimizer.zero_grad()
         # The chain rule part, this tells you on which way you should adjust the direction
@@ -128,9 +128,9 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
     return {k: v / n for k, v in running.items()}
 
 @th.no_grad()
-def validate(model, loader, segmentation_criterion, 
-            classification_criterion, device, lambda_segmentation, 
-            lambda_classification):
+def validate(model, loader, segmentation_criterion,
+            classification_criterion, device, lambda_segmentation,
+            lambda_classification, lambda_detection=1.0):
     model.eval()
     running = {"det": 0.0, 
               "seg": 0.0,
@@ -147,7 +147,7 @@ def validate(model, loader, segmentation_criterion,
         outputs = model(images)
         _, parts = compute_loss(outputs, targets, segmentation_criterion,
                                    classification_criterion, lambda_segmentation,
-                                   lambda_classification)
+                                   lambda_classification, lambda_detection)
         
         # Adding the loss to the training model
         for k in running:
@@ -178,6 +178,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--lambda-seg", type=float, default=1.0)
     parser.add_argument("--lambda-cls", type=float, default=1.0)
+    parser.add_argument("--lambda-det", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--n-val-persons", type=int, default=5)
     parser.add_argument("--out-dir", type=str, default="weights/")
@@ -224,10 +225,10 @@ def main():
     
     # Training loop
     for epoch in range(1, args.epochs + 1):
-        train_m = train_one_epoch(model, train_loader, optimizer, segmentation_criterion, 
-                                  classification_criterion, device, args.lambda_seg, args.lambda_cls)
-        val_m = validate(model, validation_loader, segmentation_criterion, 
-                                  classification_criterion, device, args.lambda_seg, args.lambda_cls)
+        train_m = train_one_epoch(model, train_loader, optimizer, segmentation_criterion,
+                                  classification_criterion, device, args.lambda_seg, args.lambda_cls, args.lambda_det)
+        val_m = validate(model, validation_loader, segmentation_criterion,
+                                  classification_criterion, device, args.lambda_seg, args.lambda_cls, args.lambda_det)
         scheduler.step()
 
         # so the curve survives even if Colab disconnects mid-training
