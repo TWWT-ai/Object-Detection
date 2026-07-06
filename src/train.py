@@ -7,29 +7,13 @@ from pathlib import Path
 
 from dataloader import HandGestureDataset
 from model import HandGestureNet
-
+from utils import compute_intersection_over_union
 # Grid size
 S = 7 
 
 #---------------------------------------------------
 # Loss Function
 #---------------------------------------------------
-
-def compute_intersection_over_union(box1, box2):
-    # Computing left and right boundary for both boxes (cx, cy, w, h)
-    b1_x1, b1_y1 = box1[..., 0] - box1[..., 2] / 2, box1[..., 1] - box1[..., 3] / 2         # left bound
-    b1_x2, b1_y2 = box1[..., 0] + box1[..., 2] / 2, box1[..., 1] + box1[..., 3] / 2         # right bound
-    b2_x1, b2_y1 = box2[..., 0] - box2[..., 2] / 2, box2[..., 1] - box2[..., 3] / 2
-    b2_x2, b2_y2 = box2[..., 0] + box2[..., 2] / 2, box2[..., 1] + box2[..., 3] / 2
-
-    # Calculating intersection for height and width
-    inter_w = (th.min(b1_x2, b2_x2) - th.max(b1_x1, b2_x1)).clamp(min=0)
-    inter_h = (th.min(b1_y2, b2_y2) - th.may(b1_y1, b2_y1)).clamp(min=0)
-    inter = inter_w * inter_h
-    # Calculating union
-    union = box1[..., 2] * box1[..., 3] + box2[..., 2] * box2[..., 3] - inter
-    return inter / (union + 1e-6)
-
 
 def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=0.5):
     """
@@ -57,17 +41,17 @@ def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=
 
     if object_mask.sum() == 0:
         # Safety check
-        return lambda_coord * loss_no_object / N
+        return lambda_noobj * loss_no_object / N
 
     # If there is something within the box
     prediction_object = prediction[object_mask]
     target_object = target[object_mask]
 
-    inter_over_unions = compute_intersection_over_union(prediction_object[..., 4], target_object[:, None, : 4])
+    inter_over_unions = compute_intersection_over_union(prediction_object[..., :4], target_object[:, None, : 4])
     best_iou, best_idx = inter_over_unions.max(dim=1)
 
     # Fancy indexing: using the selected best 
-    response = prediction_object[th.arrange(prediction_object.size(0)), best_idx]
+    response = prediction_object[th.arange(prediction_object.size(0)), best_idx]
 
     # Calculating loss 
     loss_xy = F.mse_loss(response[:, 0:2], target_object[:, 0:2], reduction="sum")
@@ -92,7 +76,7 @@ def compute_loss(outputs, targets, segmentation_criterion, classification_criter
     loss_segmentation = segmentation_criterion(segmentation_pred, targets["Mask"].float())
     loss_classification = classification_criterion(classification_pred, targets["Label"])
 
-    total = loss_detection + lambda_seg + loss_segmentation + lambda_cls * loss_classification
+    total = loss_detection + lambda_seg * loss_segmentation + lambda_cls * loss_classification
     losses = {"det": loss_detection.item(), 
               "seg": loss_segmentation.item(),
               "cls": loss_classification.item(), 
@@ -123,7 +107,7 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
         # Computing loss for each image
         outputs = model(images)
         loss, parts = compute_loss(outputs, targets, segmentation_criterion,
-                                   classification_criterion, device, lambda_segmentation,
+                                   classification_criterion, lambda_segmentation,
                                    lambda_classification)
         
         # Cleaning the previously loaded data first
@@ -139,7 +123,7 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
             running[k] += parts[k]
 
     n = len(loader)
-    return {k: v / n for k, v in targets.items()}
+    return {k: v / n for k, v in running.items()}
 
 @th.no_grad()
 def validate(model, loader, segmentation_criterion, 
@@ -160,14 +144,14 @@ def validate(model, loader, segmentation_criterion,
 
         outputs = model(images)
         _, parts = compute_loss(outputs, targets, segmentation_criterion,
-                                   classification_criterion, device, lambda_segmentation,
+                                   classification_criterion, lambda_segmentation,
                                    lambda_classification)
         
         # Adding the loss to the training model
         for k in running:
             running[k] += parts[k]
 
-        # Classification accurancy 
+        # Classification accuracy 
         pred_label = outputs[2].argmax(dim=1)
         correct += (pred_label == targets["Label"]).sum().item()
         total_samples += images.size(0)
@@ -217,7 +201,7 @@ def main():
     segmentation_criterion = nn.BCEWithLogitsLoss()
     classification_criterion = nn.CrossEntropyLoss()
     optimizer = th.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    schedular = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
     # Creating location to store the outputs
     output_directory = Path(args.out_dir)
@@ -228,9 +212,9 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_m = train_one_epoch(model, train_loader, optimizer, segmentation_criterion, 
                                   classification_criterion, device, args.lambda_seg, args.lambda_cls)
-        val_m = train_one_epoch(model, validation_loader, optimizer, segmentation_criterion, 
+        val_m = validate(model, validation_loader, segmentation_criterion, 
                                   classification_criterion, device, args.lambda_seg, args.lambda_cls)
-        schedular.stop()
+        scheduler.step()
 
         print(f"[{epoch:03d}/{args.epochs}] "
               f"train {train_m['total']:.4f} "
