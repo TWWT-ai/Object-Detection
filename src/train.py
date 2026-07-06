@@ -5,6 +5,7 @@ import argparse
 from torch.utils.data import DataLoader
 from pathlib import Path
 
+from dataloader import get_dataLoaders
 from dataloader import HandGestureDataset
 from model import HandGestureNet
 from utils import compute_intersection_over_union
@@ -190,12 +191,13 @@ def main():
     print(f"Using device: {device}")
 
     # Splitting data
-    train_set = HandGestureDataset(args.data_root, split="train")
-    validation_set = HandGestureDataset(args.data_root, split="val")
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, 
-                                num_workers=args.num_workers, pin_memory=True)
-    validation_loader = DataLoader(validation_set, batch_size=args.batch_size, shuffle=False, 
-                                num_workers=args.num_workers, pin_memory=True)
+    train_loader, validation_loader = get_dataLoaders(
+        args.data_root,
+        batch_size=args.batch_size,
+        n_val_persons=args.n_val_persons,
+        seed=args.seed,
+        num_workers=args.num_workers,
+    )
     
     #Creating model, optimizer, loss
     model = HandGestureNet(in_channels=4, n_classes=10, B=2).to(device)

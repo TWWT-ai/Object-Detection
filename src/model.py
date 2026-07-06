@@ -82,7 +82,7 @@ class SegmentationHead(nn.Module):
     def forward(self, f56, f28, f14, f7):
         # Enlarging by scale factor 2
         x = F.interpolate(f7, scale_factor=2)
-        # Following the channel(dimension 1) extend on it e.g. 1025 + 512 = 1536
+        # Following the channel(dimension 1) extend on it e.g. 1024 + 512 = 1536
         x = self.up1(th.cat([x, f14], dim=1))
         x = F.interpolate(x, scale_factor=2)
         x = self.up2(th.cat([x, f28], dim=1))
