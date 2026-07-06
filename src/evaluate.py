@@ -52,7 +52,82 @@ def segmentation_scores(seg_logits, gt_mask, eps=1e-6):
     inter = (pred_mask * gt_mask).sum(dim=(1, 2, 3))
     pred_area = pred_mask.sum(dim=(1, 2, 3))
     gt_area = gt_mask.sum(dim=(1, 2, 3))
- 
+    
     iou = (inter / (pred_area + gt_area - inter + eps)).sum().item()
-    dice = (2 * inter / (pred_area + gt_area + eps)).sum().item()
-    return iou, dice
+    dice_coef = (2 * inter / (pred_area + gt_area + eps)).sum().item()
+    return iou, dice_coef
+
+#---------------------------------------------------
+# Evaluation loop
+#---------------------------------------------------
+ 
+@th.no_grad()
+def evaluate(model, loader, device, n_classes=10, iou_thresh=0.5):
+    model.eval()
+ 
+    # Accumulators
+    confusion = th.zeros(n_classes, n_classes, dtype=th.long)   # rows = truth, cols = prediction
+    sum_seg_iou, sum_seg_dice = 0.0, 0.0
+    sum_det_iou, det_hits = 0.0, 0
+    total = 0
+ 
+    for images, targets in loader:
+        images = images.to(device)
+        targets = {k: v.to(device) for k, v in targets.items()}
+        det_pred, seg_pred, cls_pred = model(images)
+        n = images.size(0)
+        total += n
+ 
+        # ---- Classification: fill the confusion matrix ----
+        pred_label = cls_pred.argmax(dim=1)
+        for t, p in zip(targets["Label"], pred_label):
+            confusion[t.item(), p.item()] += 1
+ 
+        # ---- Segmentation: pixel IoU + Dice ----
+        batch_iou, batch_dice = segmentation_scores(seg_pred, targets["Mask"])
+        sum_seg_iou += batch_iou
+        sum_seg_dice += batch_dice
+ 
+        # ---- Detection: best box vs ground truth box, one pair per image ----
+        for i in range(n):
+            gt_box = extract_gt_box(targets["det"][i])
+            pred_box = extract_best_pred_box(det_pred[i])
+            iou = compute_intersection_over_union(pred_box, gt_box).item()
+            sum_det_iou += iou
+            if iou >= iou_thresh:
+                det_hits += 1
+ 
+    # ---- Aggregate ----
+    per_class_correct = confusion.diag().float()
+    per_class_total = confusion.sum(dim=1).float()
+ 
+    metrics = {
+        "cls_acc": (per_class_correct.sum() / total).item(),
+        "cls_acc_per_class": (per_class_correct / per_class_total.clamp(min=1)).tolist(),
+        "confusion": confusion,
+        "seg_iou": sum_seg_iou / total,
+        "seg_dice": sum_seg_dice / total,
+        "det_mean_iou": sum_det_iou / total,
+        "det_acc": det_hits / total,          # fraction of images with IoU >= iou_thresh
+        "n_samples": total,
+    }
+    return metrics
+
+
+def print_report(m, iou_thresh=0.5):
+    print("=" * 52)
+    print(f"Evaluation on {m['n_samples']} validation images")
+    print("=" * 52)
+    print(f"[Classification] accuracy       : {m['cls_acc']:.4f}")
+    for c, acc in enumerate(m["cls_acc_per_class"]):
+        print(f"                 G{c + 1:02d} accuracy   : {acc:.4f}")
+    print(f"[Segmentation]   pixel IoU      : {m['seg_iou']:.4f}")
+    print(f"                 Dice           : {m['seg_dice']:.4f}")
+    print(f"[Detection]      mean IoU       : {m['det_mean_iou']:.4f}")
+    print(f"                 acc @ IoU>={iou_thresh}: {m['det_acc']:.4f}")
+    print("\nConfusion matrix (rows = truth G01..G10, cols = prediction):")
+    header = "     " + " ".join(f"P{c + 1:02d}" for c in range(m["confusion"].size(1)))
+    print(header)
+    for r in range(m["confusion"].size(0)):
+        row = " ".join(f"{v:3d}" for v in m["confusion"][r].tolist())
+        print(f"G{r + 1:02d}  {row}")
