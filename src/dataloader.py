@@ -4,6 +4,8 @@ import PIL.Image as Image
 import pathlib
 import numpy as np
 import cv2
+from utils import encode_yolo_target
+
 
 def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0):
     root = pathlib.Path(root)
