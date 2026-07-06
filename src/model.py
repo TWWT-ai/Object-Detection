@@ -58,14 +58,19 @@ class ClassificationHead(nn.Module):
     def __init__(self, n_classes=10):
         super().__init__()
         # To classify which sign is the possible class we want (returns logit)
-        self.fc = nn.Linear(1024, n_classes)
+        self.net = nn.Sequential(
+            nn.Linear(2048, 256),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, n_classes),
+        )
 
 
     def forward(self, f7):
         # Extracting from each block whether is contains the object
-        v = F.adaptive_avg_pool2d(f7, 1).flatten(1)
-        return self.fc(v)
-    
+        avg = F.adaptive_avg_pool2d(f7, 1).flatten(1)
+        mx = F.adaptive_max_pool2d(f7, 1).flatten(1)
+        return self.net(th.cat([avg, mx], dim=1))
     
 class SegmentationHead(nn.Module):
     # Resizing back to input image size with suitable correction and modification
