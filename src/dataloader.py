@@ -27,7 +27,7 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2)
     print(f"val persons: {sorted(val_ids)}")
 
     # Datasets
-    train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_depth=True)
+    train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_flip=True, use_depth=True)
     val_ds = HandGestureDataset(root, person_ids=val_ids, augment=False, use_depth=True)
 
     # Loading Data
