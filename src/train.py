@@ -211,7 +211,7 @@ def main():
     # Creating location to store the outputs
     output_directory = Path(args.out_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
-    best_val = float("inf")
+    best_val_acc = 0.0
     history = {"train_total": [], "val_total": [], "cls_acc": []}
     
     # Training loop
@@ -234,17 +234,20 @@ def main():
               f"(det {train_m['det']:.3f} | seg {train_m['seg']:.3f} | cls {train_m['cls']:.3f})  "
               f"val {val_m['total']:.4f}  cls_acc {val_m['cls_acc']:.3f}")
 
-        # Updating the best value trained 
-        if val_m["total"] < best_val:
-            best_val = val_m["total"]
+        # Save on best val cls_acc, not val loss: with an unseen val person the
+        # loss can explode from confident wrong answers while accuracy still
+        # improves — loss-based saving froze us at a random-guessing epoch 23
+        if val_m["cls_acc"] > best_val_acc:
+            best_val_acc = val_m["cls_acc"]
             th.save({
                 "epoch": epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "val_loss": best_val,
+                "val_loss": val_m["total"],
+                "val_cls_acc": best_val_acc,
                 "args": vars(args),
             }, output_directory / "best.pth")
-            print(f"  ↳ new best (val {best_val:.4f}), checkpoint saved")
+            print(f"  ↳ new best (cls_acc {best_val_acc:.3f}), checkpoint saved")
 
     # Save the best model/value overall
     th.save({"epoch": args.epochs, "model_state": model.state_dict()},
