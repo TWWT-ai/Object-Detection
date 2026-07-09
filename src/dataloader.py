@@ -4,7 +4,7 @@ import PIL.Image as Image
 import pathlib
 import numpy as np
 import cv2
-from utils import encode_yolo_target
+from utils import encode_yolo_target, S
 
 
 def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0):
@@ -38,37 +38,28 @@ class HandGestureDataset():
         self.samples = []
         self.IMAGE_SIZE = 448
 
-        for mask_path in sorted(self.root.rglob("annotation/*png")):
-            # Breaking down path and folder
-            clip_directory = mask_path.parent.parent
+        # >>> ALL-FRAMES CHANGE: scan by rgb (not annotation) so unannotated frames are included too
+        for rgb_path in sorted(self.root.rglob("rgb/*png")):
+            clip_directory = rgb_path.parent.parent
             gesture_directory = clip_directory.parent
-            person_directory = gesture_directory.parent
-            person_id = person_directory.name
+            label = int(gesture_directory.name[1:3]) - 1
 
-            # If the person is not in the list then pass
+            stem = rgb_path.stem                 # 25040826_Guo__frame_005
+            person_id = stem.split("__")[0]
             if person_ids is not None and person_id not in person_ids:
                 continue
 
-            # Finding the index of the gesture 
-            label = int(gesture_directory.name[1:3]) - 1
+            depth_path = self._find_by_stem(clip_directory / "depth", stem)
+            mask_path  = self._find_by_stem(clip_directory / "annotation", stem)  # >>> may be None
 
-            # Building the path if in same folder / directory
-            rgb_path = clip_directory / "rgb" / mask_path.name
-            depth_path = clip_directory / "depth" / (mask_path.name + ".npy")
+            if depth_path is None:               # rgb/depth 是必须的;mask 可以没有
+                self.skipped += 1
+                continue
 
-            # Safety check
-            if not rgb_path.exists():
-                raise FileExistsError(f"RGB does not exists in the folder: {rgb_path}")
-            if not depth_path.exists():
-                raise FileExistsError(f"Depth does not exists in the folder: {depth_path}")
-
-            # Adding into the samples
             self.samples.append({
-                "RGB": rgb_path,
-                "Depth": depth_path,
-                "Mask": mask_path,
-                "Label": label,
-                "Person": person_id
+                "RGB": rgb_path, "Depth": depth_path,
+                "Mask": mask_path,               # >>> can be None now
+                "Label": label, "Person": person_id,
             })
 
         if len(self.samples) == 0:
@@ -90,8 +81,13 @@ class HandGestureDataset():
         depth = np.load(s["Depth"]).astype(np.float32)
 
         # 3. Mask into binary mask
-        mask = np.array(Image.open(s["Mask"]).convert("L"))  # "L" means grey scale (0 - 255)
-        mask = (mask > 127).astype(np.float32)               # separating hand (> 127) and background
+        if s["Mask"] is not None:
+            mask = np.array(Image.open(s["Mask"]).convert("L"))
+            mask = (mask > 127).astype(np.float32)
+            has_mask = 1.0
+        else:
+            mask = np.zeros((self.IMAGE_SIZE, self.IMAGE_SIZE), np.float32)
+            has_mask = 0.0
 
         label = s["Label"]
         
@@ -150,11 +146,24 @@ class HandGestureDataset():
         image = th.from_numpy(image).permute(2, 0, 1).float()
         mask = th.from_numpy(mask).unsqueeze(0).float()
 
-        targets = {"Image": image,
-                "Mask": mask,
-                "Boundary_Box": th.from_numpy(boundary_box),
-                "Label": s["Label"]
-                }
+        if has_mask:
+            rows, cols = np.where(mask == 1)
+            if len(rows) == 0:
+                has_mask = 0.0
+                det_target = th.zeros(S, S, 5)
+            else:
+                boundary_box = np.array([cols.min(), rows.min(), cols.max(), rows.max()], np.float32)
+                boundary_box = boundary_box / self.IMAGE_SIZE
+                det_target = encode_yolo_target(boundary_box)
+        else:
+            det_target = th.zeros(S, S, 5) 
+
+        targets = {
+            "det": det_target,
+            "Mask": mask,
+            "Label": th.tensor(s["Label"], dtype=th.long),
+            "has_mask": th.tensor(has_mask, dtype=th.float32),
+        }
         
         return image, targets
 
