@@ -6,3 +6,5 @@ figures/
 *.pth
 __pycache__/
 Cheat Sheet.md
+*.zip
+*.pdf
