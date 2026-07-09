@@ -1,6 +1,7 @@
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 
 def conv_block(channel_in, channel_out, k=3, s=1):
     # s=1 only thickening, s=2 shrinking and thickening
@@ -15,23 +16,35 @@ def conv_block(channel_in, channel_out, k=3, s=1):
 class Backbone(nn.Module):
     def __init__(self, in_channels=4):
         super().__init__()
-        # Reducing the pixels into 7x7 (448 / 2^6)
-        # 7x7 being the box of determining the size of the grid cell
-        self.s1 = nn.Sequential(conv_block(in_channels, 32, s=2), conv_block(32, 32))
-        self.s2 = nn.Sequential(conv_block(32, 64, s=2), conv_block(64, 64))
-        self.s3 = nn.Sequential(conv_block(64, 128, s=2), conv_block(128, 128))
-        self.s4 = nn.Sequential(conv_block(128, 256, s=2), conv_block(256, 256))
-        self.s5 = nn.Sequential(conv_block(256, 512, s=2), conv_block(512, 512))
-        self.s6 = nn.Sequential(conv_block(512, 1024, s=2), conv_block(1024, 1024))
+        # >>> PRETRAINED CHANGE: use ImageNet-pretrained ResNet34 instead of training from scratch
+        resnet = torchvision.models.resnet34(weights=torchvision.models.ResNet34_Weights.DEFAULT)
 
+        # >>> PRETRAINED CHANGE: inflate first conv 3ch -> in_channels(4).
+        # Keep pretrained RGB weights; init the depth channel from the mean of RGB weights.
+        old = resnet.conv1                                   # Conv2d(3, 64, 7, stride=2, padding=3)
+        new = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        with th.no_grad():
+            new.weight[:, :3] = old.weight
+            if in_channels > 3:
+                new.weight[:, 3:] = old.weight.mean(dim=1, keepdim=True).repeat(1, in_channels - 3, 1, 1)
+        resnet.conv1 = new
+
+        # 448 -> 112 (conv1 s2, then maxpool s2)
+        self.stem   = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
+        self.layer1 = resnet.layer1     # 112, 64ch
+        self.layer2 = resnet.layer2     # 56,  128ch -> f56
+        self.layer3 = resnet.layer3     # 28,  256ch -> f28
+        self.layer4 = resnet.layer4     # 14,  512ch -> f14
+        # >>> PRETRAINED CHANGE: one extra stride-2 block to reach the 7x7 / 1024ch that the heads expect
+        self.to_f7  = conv_block(512, 1024, s=2)   # 14 -> 7
 
     def forward(self, x):
-        # Forward pass to get data from size 7 to 56 and later hand to SegmentationHead to help to classify the border
-        # Mainly using s3 to s5 to calibrate the shape, therefore keeping the record all these data and ready to share backbone
-        f56 = self.s3(self.s2(self.s1(x)))
-        f28 = self.s4(f56)
-        f14 = self.s5(f28)
-        f7 = self.s6(f14)
+        x   = self.stem(x)        # 112
+        x   = self.layer1(x)      # 112
+        f56 = self.layer2(x)      # 56,  128
+        f28 = self.layer3(f56)    # 28,  256
+        f14 = self.layer4(f28)    # 14,  512
+        f7  = self.to_f7(f14)     # 7,   1024
         return f56, f28, f14, f7
 
 
