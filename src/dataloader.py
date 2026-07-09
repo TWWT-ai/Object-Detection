@@ -8,33 +8,59 @@ import cv2
 from utils import encode_yolo_target
 
 
-def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2):
+def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
+                    val_frac=0.1, test_frac=0.1):   # >>> MERGED-DATA CHANGE: added frac params for 3-way split
     root = pathlib.Path(root)
-    persons = sorted(p.name for p in root.iterdir() if p.is_dir())
+
+    # >>> MERGED-DATA CHANGE:
+    # Top-level folders are GESTURES now (G01_call...), not persons, so iterdir()
+    # would return gestures instead of people. Collect persons from the FILENAME
+    # PREFIX ("25040826_Guo__frame_005") instead. Original line kept below for reference.
+    # persons = sorted(p.name for p in root.iterdir() if p.is_dir())
+    persons = sorted({p.stem.split("__")[0] for p in root.rglob("annotation/*png")})
+    if not persons:
+        raise RuntimeError(f"No annotation found under {root}")
 
     # Selecting people to load
     rng = np.random.default_rng(seed)
     rng.shuffle(persons)
-    val_ids = set(persons[:n_val_persons])
-    train_ids = set(persons[n_val_persons:])
+
+    # >>> MERGED-DATA CHANGE:
+    # 3-way person-level split (train/val/test) by fraction instead of a fixed
+    # n_val_persons count. n_val_persons is now IGNORED (kept in the signature so
+    # existing callers don't break). Split is still by PERSON -> no leakage.
+    n = len(persons)
+    n_test = max(1, round(n * test_frac))          # ~10% of people
+    n_val  = max(1, round(n * val_frac))           # ~10% of people
+    n_val  = min(n_val, n - n_test - 1)            # keep at least 1 person for train
+    val_ids   = set(persons[n_test:n_test + n_val])
+    train_ids = set(persons[n_test + n_val:])
+    test_ids  = set(persons[:n_test])              # >>> MERGED-DATA CHANGE: new held-out test people
 
     # Smoke-test fallback: too few persons to split -> everyone plays both roles
     if len(train_ids) == 0:
         print("WARNING: too few persons for a real split, "
               "using ALL persons for both train and val (smoke test only)")
-        train_ids = val_ids = set(persons)
+        train_ids = val_ids = test_ids = set(persons)   # >>> MERGED-DATA CHANGE: test joins the fallback too
 
     print(f"val persons: {sorted(val_ids)}")
+    # >>> MERGED-DATA CHANGE: also print train/test so the whole split is visible
+    print(f"train persons: {sorted(train_ids)}")
+    print(f"test persons:  {sorted(test_ids)}")
 
     # Datasets
     train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_flip=True, use_depth=True)
     val_ds = HandGestureDataset(root, person_ids=val_ids, augment=False, use_depth=True)
+    # >>> MERGED-DATA CHANGE: test set — no augmentation, held out for final scoring
+    test_ds = HandGestureDataset(root, person_ids=test_ids, augment=False, use_depth=True)
 
     # Loading Data
     train_loader = DataLoader(train_ds, batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    # >>> MERGED-DATA CHANGE: test loader (shuffle off)
+    test_loader = DataLoader(test_ds, batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    return train_loader, val_loader
+    return train_loader, val_loader, test_loader   # >>> MERGED-DATA CHANGE: returns 3 loaders now (was 2)
 
 class HandGestureDataset():
     def __init__(self, root, person_ids=None, transform=None, augment=False, use_flip=False, use_depth=False):
@@ -51,8 +77,13 @@ class HandGestureDataset():
             # Breaking down path and folder
             clip_directory = mask_path.parent.parent
             gesture_directory = clip_directory.parent
-            person_directory = gesture_directory.parent
-            person_id = person_directory.name
+
+            # >>> MERGED-DATA CHANGE:
+            # After merging by gesture, the top-level folder is the GESTURE, not the
+            # person, so gesture_directory.parent is now the dataset root. The person
+            # now lives in the FILENAME PREFIX instead: "25040826_Guo__frame_005".
+            stem = mask_path.stem                 # e.g. 25040826_Guo__frame_005
+            person_id = stem.split("__")[0]       # 25040826_Guo
 
             # If the person is not in the list then pass
             if person_ids is not None and person_id not in person_ids:
@@ -67,8 +98,13 @@ class HandGestureDataset():
             frame_match = re.search(r"frame_?\d+", mask_path.stem)
             frame_id = frame_match.group(0) if frame_match else mask_path.stem
 
-            rgb_path = self._find_frame(clip_directory / "rgb", frame_id)
-            depth_path = self._find_frame(clip_directory / "depth", frame_id)
+            # >>> MERGED-DATA CHANGE:
+            # The merge step already renamed rgb/depth/annotation to the SAME name
+            # ("{person}__{frame}"), and one folder now holds many people's frame_005,
+            # so FRAME NUMBER alone is no longer unique -> it would mis-pair across people.
+            # Match by the FULL stem instead. (frame_id above is kept for reference only.)
+            rgb_path = self._find_by_stem(clip_directory / "rgb", stem)
+            depth_path = self._find_by_stem(clip_directory / "depth", stem)
 
             # Skip (and count) incomplete samples instead of crashing:
             # one classmate's missing file should not block the whole cohort
@@ -90,14 +126,14 @@ class HandGestureDataset():
 
         if len(self.samples) == 0:
             raise RuntimeError(f"No File found in this root: {self.root}")
-
+        
     @staticmethod
-    def _find_frame(folder, frame_id):
+    def _find_by_stem(folder, stem):
         """Return the file in `folder` whose name contains `frame_id`, else None."""
         if not folder.is_dir():
             return None
         for p in sorted(folder.iterdir()):
-            if frame_id in p.name:
+            if p.stem == stem:
                 return p
         return None
             

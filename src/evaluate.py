@@ -115,6 +115,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--n-val-persons", type=int, default=5)
+    parser.add_argument("--val-frac", type=float, default=0.1)
+    parser.add_argument("--test-frac", type=float, default=0.1)
     parser.add_argument("--iou-thresh", type=float, default=0.5)
     # MUST match the seed used in training, otherwise the person split
     # changes and "validation" persons leak from the training set
@@ -125,12 +127,14 @@ def main():
     print(f"Using device: {device}")
  
     # Same split as training (same seed -> same val persons)
-    _, val_loader = get_dataLoaders(
+    _, _, test_loader = get_dataLoaders(
         args.data_root,
         batch_size=args.batch_size,
         n_val_persons=args.n_val_persons,
         seed=args.seed,
         num_workers=args.num_workers,
+        val_frac=args.val_frac,
+        test_frac=args.test_frac,
     )
  
     # Rebuild the empty model, then pour the trained weights back in
@@ -140,7 +144,7 @@ def main():
     print(f"Loaded {args.weights} (epoch {checkpoint.get('epoch', '?')}, "
           f"val_loss {checkpoint.get('val_loss', float('nan')):.4f})")
  
-    metrics = evaluate(model, val_loader, device, iou_thresh=args.iou_thresh)
+    metrics = evaluate(model, test_loader, device, iou_thresh=args.iou_thresh)
     print_report(metrics, iou_thresh=args.iou_thresh)
  
  
