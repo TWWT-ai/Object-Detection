@@ -176,27 +176,10 @@ class HandGestureDataset():
                 depth = depth[:, ::-1].copy()
                 mask = mask[:, ::-1].copy()
 
-            # Adjusting brightness (range widened 0.7-1.3 -> 0.5-1.5 for
-            # cross-person lighting robustness)
+            # Adjusting brightness
             if np.random.rand() < 0.5:
-                factor = np.random.uniform(0.5, 1.5)
+                factor = np.random.uniform(0.7, 1.3)
                 rgb = np.clip(rgb.astype(np.float32) * factor, 0, 255).astype(np.uint8)
-
-            # Random shift + scale: hand position/size changes every epoch, so
-            # "recognize the background" stops working as a shortcut.
-            # rgb / depth / mask MUST get the same transform.
-            if np.random.rand() < 0.5:
-                scale = np.random.uniform(0.9, 1.2)
-                tx = np.random.uniform(-0.08, 0.08) * self.IMAGE_SIZE
-                ty = np.random.uniform(-0.08, 0.08) * self.IMAGE_SIZE
-                M = np.float32([[scale, 0, tx], [0, scale, ty]])
-                size = (self.IMAGE_SIZE, self.IMAGE_SIZE)
-                rgb_a = cv2.warpAffine(rgb, M, size, flags=cv2.INTER_LINEAR)
-                depth_a = cv2.warpAffine(depth, M, size, flags=cv2.INTER_LINEAR)
-                # NEAREST for the mask: 0/1 labels must not be blended into 0.5
-                mask_a = cv2.warpAffine(mask, M, size, flags=cv2.INTER_NEAREST)
-                if mask_a.sum() > 0:      # keep only if the hand stayed in frame
-                    rgb, depth, mask = rgb_a, depth_a, mask_a
 
         # Measuring the boundary box after resized
         rows, cols = np.where(mask==1)

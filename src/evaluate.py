@@ -91,7 +91,7 @@ def evaluate(model, loader, device, n_classes=10, iou_thresh=0.5):
 
 def print_report(m, iou_thresh=0.5):
     print("=" * 52)
-    print(f"Evaluation on {m['n_samples']} validation images")
+    print(f"Evaluation on {m['n_samples']} held-out TEST images (unseen person)")
     print("=" * 52)
     print(f"[Classification] accuracy       : {m['cls_acc']:.4f}")
     for c, acc in enumerate(m["cls_acc_per_class"]):
