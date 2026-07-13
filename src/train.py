@@ -181,8 +181,6 @@ def main():
     parser.add_argument("--lambda-det", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--n-val-persons", type=int, default=5)
-    parser.add_argument("--val-frac", type=float, default=0.1)
-    parser.add_argument("--test-frac", type=float, default=0.1)
     parser.add_argument("--out-dir", type=str, default="weights/")
     parser.add_argument("--seed", type=int, default=42)
     # Pack all the top argument into one
@@ -195,14 +193,12 @@ def main():
     print(f"Using device: {device}")
 
     # Splitting data
-    train_loader, validation_loader, test_loader = get_dataLoaders(
+    train_loader, validation_loader = get_dataLoaders(
         args.data_root,
         batch_size=args.batch_size,
         n_val_persons=args.n_val_persons,
         seed=args.seed,
         num_workers=args.num_workers,
-        val_frac=args.val_frac,
-        test_frac=args.test_frac,
     )
     
     #Creating model, optimizer, loss

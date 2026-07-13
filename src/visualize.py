@@ -158,8 +158,6 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--n-val-persons", type=int, default=5)
-    parser.add_argument("--val-frac", type=float, default=0.1)
-    parser.add_argument("--test-frac", type=float, default=0.1)
     # Same seed as training, same reason as evaluate.py: keep the split identical
     parser.add_argument("--seed", type=int, default=42)
     # For an EXTERNAL test set: use every person in --data-root, no splitting
@@ -170,21 +168,13 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.all_data:
-        test_ds = HandGestureDataset(args.data_root, person_ids=None, augment=False, use_depth=True)
-        test_loader = DataLoader(test_ds, args.batch_size, shuffle=False,
-                                 num_workers=args.num_workers, pin_memory=True)
-        print(f"External test set: {len(test_ds)} images, ALL persons used")
-    else:
-        _, _, test_loader = get_dataLoaders(
-            args.data_root,
-            batch_size=args.batch_size,
-            n_val_persons=args.n_val_persons,
-            seed=args.seed,
-            num_workers=args.num_workers,
-            val_frac=args.val_frac,
-            test_frac=args.test_frac,
-        )
+    _, val_loader = get_dataLoaders(
+        args.data_root,
+        batch_size=args.batch_size,
+        n_val_persons=args.n_val_persons,
+        seed=args.seed,
+        num_workers=args.num_workers,
+    )
 
     model = HandGestureNet(in_channels=4, n_classes=10, B=2).to(device)
     checkpoint = th.load(args.weights, map_location=device)
@@ -192,10 +182,10 @@ def main():
     print(f"Loaded {args.weights}")
 
     # 1. Per-image predictions: boxes + masks + labels
-    show_predictions(model, test_loader, device, out_dir, n_samples=args.n_samples)
+    show_predictions(model, val_loader, device, out_dir, n_samples=args.n_samples)
 
     # 2. Confusion matrix heatmap (reuses evaluate() so numbers always match the report)
-    metrics = evaluate(model, test_loader, device)
+    metrics = evaluate(model, val_loader, device)
     plot_confusion_matrix(metrics["confusion"], out_dir / "confusion_matrix.png")
 
     # 3. Loss curves, if train.py saved a history file
