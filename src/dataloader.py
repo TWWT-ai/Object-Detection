@@ -178,7 +178,7 @@ class HandGestureDataset():
 
             # Adjusting brightness
             if np.random.rand() < 0.5:
-                factor = np.random.uniform(0.7, 1.3)
+                factor = np.random.uniform(0.5, 1.5)
                 rgb = np.clip(rgb.astype(np.float32) * factor, 0, 255).astype(np.uint8)
 
         # Measuring the boundary box after resized
