@@ -1,0 +1,7 @@
+# Core deep-learning stack (Colab already ships compatible versions of all of these)
+torch>=2.0.0          # model, training, tensors
+torchvision>=0.15.0   # pretrained ResNet18 backbone + transforms
+numpy>=1.24           # array math for masks, boxes, metrics
+Pillow>=9.0           # image / mask loading and result drawing (lighter than OpenCV)
+matplotlib>=3.7       # training curves and visualisations in the notebook
+tqdm>=4.65            # progress bars in the notebook training loop

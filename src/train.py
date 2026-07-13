@@ -1,263 +1,123 @@
-import torch as th
-import torch.nn as nn
-import torch.nn.functional as F
-import argparse
-from torch.utils.data import DataLoader
-from pathlib import Path
-import json
+"""Training script: python -m src.train [--data data] [--epochs 60]
 
-from dataloader import get_dataLoaders
-from dataloader import HandGestureDataset
-from model import HandGestureNet
-from utils import compute_intersection_over_union
-# Grid size
-S = 7 
+Trains the multi-task YOLOv1 model and saves the checkpoint with the best
+validation box IoU (box IoU is chosen as the model-selection metric because
+localisation is the hardest of the three tasks on this tiny dataset —
+classification saturates early and would not discriminate between checkpoints).
+"""
 
-#---------------------------------------------------
-# Loss Function
-#---------------------------------------------------
+import argparse                      # command-line arguments
+import random                        # seeding
+import numpy as np                   # seeding + metric math
+import torch                         # everything ML
+from torch.utils.data import DataLoader  # batching
 
-def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=0.5):
-    """
-        Steps:
-        1. Split cells into two groups -> 
-        2. Push confidence toward zero for no-object cells ->
-        3. Responsible-box selection ->
-        4. Computing the three loss term: xy, wh, conf ->
-        5. Weighted sum
-    """
-
-    N = prediction.size(0)
-    # Unzip the combined last index back to Box (B) and (x, y, w, h, confidence)
-    prediction = prediction.view(N, S, S, B, 5)
-
-    # Detect whether there is an object within the boxes
-    object_mask = target[..., 4] > 0.5
-    no_object_mask = ~object_mask             # Flipping the mask
-
-    # Selecting total numbers of all the boxes with the object and the confidence of the object
-    no_object_conf = prediction[no_object_mask][..., 4]
-    # Creating a no_object_conf size like (assumed correct answer) but filled with 0, containing all cells without object
-    # Anything not equal to 0 will be considered loss/wrong prediction, to reduce the falseness reflected on to the last model
-    loss_no_object = F.mse_loss(no_object_conf, th.zeros_like(no_object_conf), reduction="sum")
-
-    if object_mask.sum() == 0:
-        # Safety check
-        return lambda_noobj * loss_no_object / N
-
-    # If there is something within the box
-    prediction_object = prediction[object_mask]
-    target_object = target[object_mask]
-
-    inter_over_unions = compute_intersection_over_union(prediction_object[..., :4], target_object[:, None, : 4])
-    best_iou, best_idx = inter_over_unions.max(dim=1)
-
-    # Fancy indexing: using the selected best 
-    response = prediction_object[th.arange(prediction_object.size(0)), best_idx]
-
-    # Calculating loss 
-    loss_xy = F.mse_loss(response[:, 0:2], target_object[:, 0:2], reduction="sum")
-    # Square root would punish small boundary boxes more 
-    loss_wh = F.mse_loss(
-        th.sqrt(response[:, 2:4].clamp(min=1e-6)),
-        th.sqrt(target_object[:, 2:4].clamp(min=1e-6)),
-        reduction="sum",
-    )
-    loss_confidence = F.mse_loss(response[:, 4], best_iou.detach(), reduction="sum")
-
-    # Returning Multi Part loss function
-    return (lambda_coord * (loss_xy + loss_wh) + loss_confidence + lambda_noobj * loss_no_object) / N
+from . import config                                              # hyper-parameters
+from .dataset import GestureDataset, scan_dataset, split_per_class  # data pipeline
+from .loss import YoloV1Loss, seg_loss                            # the two losses
+from .model import YoloV1Gesture                                  # the network
+from .utils import decode_predictions, iou_xyxy                   # evaluation helpers
 
 
-def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0):
-    # Computing loss function for each Head defined in models
-    detection_pred, segmentation_pred, classification_pred = outputs
-
-    # Loss per Head
-    loss_detection = yolo_detection_loss(detection_pred, targets["det"])
-    loss_segmentation = segmentation_criterion(segmentation_pred, targets["Mask"].float())
-    loss_classification = classification_criterion(classification_pred, targets["Label"])
-
-    total = lambda_det * loss_detection + lambda_seg * loss_segmentation + lambda_cls * loss_classification
-    losses = {"det": loss_detection.item(), 
-              "seg": loss_segmentation.item(),
-              "cls": loss_classification.item(), 
-              "total": total.item()
-              }
-    return total, losses
+def set_seed(seed):
+    """Seed every RNG so runs are reproducible (essential when comparing changes)."""
+    random.seed(seed)                 # python RNG (used by the augmentations + split)
+    np.random.seed(seed)              # numpy RNG
+    torch.manual_seed(seed)           # torch CPU RNG
+    torch.cuda.manual_seed_all(seed)  # torch GPU RNG
 
 
-#---------------------------------------------------
-# Train and validation
-#---------------------------------------------------
+@torch.no_grad()                      # evaluation never needs gradients -> saves memory/time
+def evaluate(model, loader, det_criterion):
+    """Return (val loss, class accuracy, mean box IoU, mean mask IoU) on a loader."""
+    model.eval()                                                   # switch off dropout/BN updates
+    tot_loss, n_img = 0.0, 0                                       # running sums
+    correct, box_ious, mask_ious = 0, [], []
+    for img, target, mask in loader:                               # iterate validation batches
+        img = img.to(config.DEVICE)                                # move to GPU
+        target = target.to(config.DEVICE)
+        mask = mask.to(config.DEVICE)
+        det, seg = model(img)                                      # forward pass
+        loss = det_criterion(det, target) + config.LAMBDA_SEG * seg_loss(seg, mask)
+        tot_loss += loss.item() * img.shape[0]                     # de-average for correct mean later
+        prob = torch.sigmoid(seg)                                  # mask probabilities
+        for k in range(img.shape[0]):                              # per-image metrics
+            n_img += 1
+            cls_pred, _, box_pred = decode_predictions(            # best predicted box + class
+                det[k].cpu(), config.S, config.B, config.C, config.IMG_SIZE)
+            obj = (target[k, ..., 4] > 0.5).nonzero(as_tuple=False)[0]  # the single GT cell (i,j)
+            i, j = int(obj[0]), int(obj[1])
+            tcell = target[k, i, j]                                # GT vector in that cell
+            cls_gt = int(tcell[5:].argmax())                       # GT class from the one-hot part
+            cx = (j + float(tcell[0])) / config.S * config.IMG_SIZE  # decode GT box back to pixels
+            cy = (i + float(tcell[1])) / config.S * config.IMG_SIZE  # (same maths as the encoder,
+            bw = float(tcell[2]) * config.IMG_SIZE                   # inverted)
+            bh = float(tcell[3]) * config.IMG_SIZE
+            box_gt = [cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2]
+            correct += int(cls_pred == cls_gt)                     # classification accuracy count
+            box_ious.append(iou_xyxy(box_pred, box_gt))            # localisation quality
+            pm = (prob[k, 0] > 0.5).float()                        # binarise the predicted mask
+            gm = mask[k, 0]                                        # GT mask
+            inter = (pm * gm).sum().item()                         # mask IoU numerator
+            union = pm.sum().item() + gm.sum().item() - inter      # mask IoU denominator
+            mask_ious.append(inter / union if union > 0 else 1.0)  # both empty -> perfect match
+    return (tot_loss / max(n_img, 1), correct / max(n_img, 1),
+            float(np.mean(box_ious)), float(np.mean(mask_ious)))
 
-def train_one_epoch(model, loader, optimizer, segmentation_criterion,
-                    classification_criterion, device, lambda_segmentation,
-                    lambda_classification, lambda_detection=1.0):
-    model.train()
-    running = {"det": 0.0, 
-              "seg": 0.0,
-              "cls": 0.0, 
-              "total": 0.0
-              }
-    
-    for images, targets in loader:
-        # Copying what is on CPU onto GPU (RAM to VRAM)
-        images = images.to(device)
-        targets = {k: v.to(device) for k, v in targets.items()}
-
-        # Computing loss for each image
-        outputs = model(images)
-        loss, parts = compute_loss(outputs, targets, segmentation_criterion,
-                                   classification_criterion, lambda_segmentation,
-                                   lambda_classification, lambda_detection)
-
-        # Cleaning the previously loaded data first
-        optimizer.zero_grad()
-        # The chain rule part, this tells you on which way you should adjust the direction
-        # dloss/dw = dloss/dy * dy/dz * dz/dw
-        loss.backward()
-        # Using Adam formula to update the and override the old data
-        optimizer.step()
-
-        # Adding the loss to the training model
-        for k in running:
-            running[k] += parts[k]
-
-    n = len(loader)
-    return {k: v / n for k, v in running.items()}
-
-@th.no_grad()
-def validate(model, loader, segmentation_criterion,
-            classification_criterion, device, lambda_segmentation,
-            lambda_classification, lambda_detection=1.0):
-    model.eval()
-    running = {"det": 0.0, 
-              "seg": 0.0,
-              "cls": 0.0, 
-              "total": 0.0
-              }
-    correct, total_samples = 0, 0
-
-    for images, targets in loader:
-        # Copying what is on CPU onto GPU (RAM to VRAM)
-        images = images.to(device)
-        targets = {k: v.to(device) for k, v in targets.items()}
-
-        outputs = model(images)
-        _, parts = compute_loss(outputs, targets, segmentation_criterion,
-                                   classification_criterion, lambda_segmentation,
-                                   lambda_classification, lambda_detection)
-        
-        # Adding the loss to the training model
-        for k in running:
-            running[k] += parts[k]
-
-        # Classification accuracy 
-        pred_label = outputs[2].argmax(dim=1)
-        correct += (pred_label == targets["Label"]).sum().item()
-        total_samples += images.size(0)
-
-    n = len(loader)
-    metrics = {k: v / n for k, v in running.items()}
-    metrics["cls_acc"] = correct / total_samples
-    return metrics
-
-
-#---------------------------------------------------
-# Main method
-#---------------------------------------------------
 
 def main():
-    # Like creating an empty sheet with all the data we are tracking
-    parser = argparse.ArgumentParser(description="Train HandGestureNet (CW1)")
-    parser.add_argument("--data-root", type=str, default="data/")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--lambda-seg", type=float, default=1.0)
-    parser.add_argument("--lambda-cls", type=float, default=1.0)
-    parser.add_argument("--lambda-det", type=float, default=1.0)
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--n-val-persons", type=int, default=5)
-    parser.add_argument("--val-frac", type=float, default=0.1)
-    parser.add_argument("--test-frac", type=float, default=0.1)
-    parser.add_argument("--out-dir", type=str, default="weights/")
-    parser.add_argument("--seed", type=int, default=42)
-    # Pack all the top argument into one
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', default=config.DATA_ROOT)        # dataset root folder
+    parser.add_argument('--epochs', type=int, default=config.EPOCHS)
     args = parser.parse_args()
 
-    # Keeping the training sample set the same every training at the start
-    th.manual_seed(args.seed)
-    # Selecting the available GPU device
-    device = th.device("cuda" if th.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    set_seed(config.SEED)                                          # reproducibility first
+    samples, class_names = scan_dataset(args.data)                 # find all rgb/annotation pairs
+    print(f'Found {len(samples)} samples, classes: {class_names}')
+    train_idx, val_idx = split_per_class(samples, config.VAL_FRACTION, config.SEED)
+    train_ds = GestureDataset(samples, train_idx, augment=True)    # training set WITH augmentation
+    val_ds = GestureDataset(samples, val_idx, augment=False)       # val set WITHOUT (deterministic eval)
+    train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True,
+                              num_workers=2, pin_memory=True)      # shuffle: decorrelate batches
+    val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False,
+                            num_workers=2, pin_memory=True)
 
-    # Splitting data
-    train_loader, validation_loader, test_loader = get_dataLoaders(
-        args.data_root,
-        batch_size=args.batch_size,
-        n_val_persons=args.n_val_persons,
-        seed=args.seed,
-        num_workers=args.num_workers,
-        val_frac=args.val_frac,
-        test_frac=args.test_frac,
-    )
-    
-    #Creating model, optimizer, loss
-    model = HandGestureNet(in_channels=4, n_classes=10, B=2).to(device)
-    segmentation_criterion = nn.BCEWithLogitsLoss()
-    classification_criterion = nn.CrossEntropyLoss()
-    optimizer = th.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    
-    # Creating location to store the outputs
-    output_directory = Path(args.out_dir)
-    output_directory.mkdir(parents=True, exist_ok=True)
-    best_val_acc = 0.0
-    history = {"train_total": [], "val_total": [], "cls_acc": []}
-    
-    # Training loop
+    model = YoloV1Gesture().to(config.DEVICE)                      # build + move the network
+    det_criterion = YoloV1Loss()                                   # YOLOv1 detection loss
+    # AdamW instead of the paper's SGD + hand-tuned LR schedule: AdamW adapts per-parameter
+    # step sizes, which converges much faster on small datasets and needs no warmup tuning.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LR,
+                                  weight_decay=config.WEIGHT_DECAY)
+    # cosine annealing smoothly decays the LR to ~0 — a simple, schedule that avoids
+    # picking manual step milestones for an unknown dataset.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    best_iou = 0.0                                                 # best val box IoU so far
     for epoch in range(1, args.epochs + 1):
-        train_m = train_one_epoch(model, train_loader, optimizer, segmentation_criterion,
-                                  classification_criterion, device, args.lambda_seg, args.lambda_cls, args.lambda_det)
-        val_m = validate(model, validation_loader, segmentation_criterion,
-                                  classification_criterion, device, args.lambda_seg, args.lambda_cls, args.lambda_det)
-        scheduler.step()
-
-        # so the curve survives even if Colab disconnects mid-training
-        history["train_total"].append(train_m["total"])
-        history["val_total"].append(val_m["total"])
-        history["cls_acc"].append(val_m["cls_acc"])
-        with open(output_directory / "history.json", "w") as f:
-            json.dump(history, f)
-
-        print(f"[{epoch:03d}/{args.epochs}] "
-              f"train {train_m['total']:.4f} "
-              f"(det {train_m['det']:.3f} | seg {train_m['seg']:.3f} | cls {train_m['cls']:.3f})  "
-              f"val {val_m['total']:.4f}  cls_acc {val_m['cls_acc']:.3f}")
-
-        # Save on best val cls_acc, not val loss: with an unseen val person the
-        # loss can explode from confident wrong answers while accuracy still
-        # improves — loss-based saving froze us at a random-guessing epoch 23
-        if val_m["cls_acc"] > best_val_acc:
-            best_val_acc = val_m["cls_acc"]
-            th.save({
-                "epoch": epoch,
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "val_loss": val_m["total"],
-                "val_cls_acc": best_val_acc,
-                "args": vars(args),
-            }, output_directory / "best.pth")
-            print(f"  ↳ new best (cls_acc {best_val_acc:.3f}), checkpoint saved")
-
-    # Save the best model/value overall
-    th.save({"epoch": args.epochs, "model_state": model.state_dict()},
-               output_directory / "last.pth")
-    print("Training finished.")
+        model.train()                                              # enable BN updates / augment path
+        running = 0.0
+        for img, target, mask in train_loader:                     # one pass over the training set
+            img = img.to(config.DEVICE)
+            target = target.to(config.DEVICE)
+            mask = mask.to(config.DEVICE)
+            det, seg = model(img)                                  # forward
+            loss = det_criterion(det, target) + config.LAMBDA_SEG * seg_loss(seg, mask)
+            optimizer.zero_grad()                                  # clear old gradients
+            loss.backward()                                        # backprop through both heads
+            optimizer.step()                                       # update weights
+            running += loss.item() * img.shape[0]
+        scheduler.step()                                           # decay the learning rate
+        val_loss, acc, biou, miou = evaluate(model, val_loader, det_criterion)
+        print(f'epoch {epoch:3d} | train {running / len(train_ds):.3f} | '
+              f'val {val_loss:.3f} | acc {acc:.2f} | box IoU {biou:.3f} | mask IoU {miou:.3f}')
+        if biou > best_iou:                                        # keep only the best checkpoint
+            best_iou = biou
+            torch.save({'model': model.state_dict(),               # weights
+                        'classes': class_names},                   # class names travel with the model
+                       config.CHECKPOINT)
+            print(f'  saved new best (box IoU {biou:.3f})')
+    print(f'Done. Best val box IoU: {best_iou:.3f} -> {config.CHECKPOINT}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
