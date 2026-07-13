@@ -8,7 +8,8 @@ import matplotlib
 matplotlib.use("Agg")          # No display needed: always render to files (works on Colab / ssh)
 import matplotlib.pyplot as plt
 
-from dataloader import get_dataLoaders
+from torch.utils.data import DataLoader
+from dataloader import get_dataLoaders, HandGestureDataset
 from model import HandGestureNet
 from utils import extract_gt_box, extract_best_pred_box
 from evaluate import evaluate
@@ -161,21 +162,29 @@ def main():
     parser.add_argument("--test-frac", type=float, default=0.1)
     # Same seed as training, same reason as evaluate.py: keep the split identical
     parser.add_argument("--seed", type=int, default=42)
+    # For an EXTERNAL test set: use every person in --data-root, no splitting
+    parser.add_argument("--all-data", action="store_true")
     args = parser.parse_args()
 
     device = th.device("cuda" if th.cuda.is_available() else "cpu")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    _, _, test_loader = get_dataLoaders(
-        args.data_root,
-        batch_size=args.batch_size,
-        n_val_persons=args.n_val_persons,
-        seed=args.seed,
-        num_workers=args.num_workers,
-        val_frac=args.val_frac,
-        test_frac=args.test_frac,
-    )
+    if args.all_data:
+        test_ds = HandGestureDataset(args.data_root, person_ids=None, augment=False, use_depth=True)
+        test_loader = DataLoader(test_ds, args.batch_size, shuffle=False,
+                                 num_workers=args.num_workers, pin_memory=True)
+        print(f"External test set: {len(test_ds)} images, ALL persons used")
+    else:
+        _, _, test_loader = get_dataLoaders(
+            args.data_root,
+            batch_size=args.batch_size,
+            n_val_persons=args.n_val_persons,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            val_frac=args.val_frac,
+            test_frac=args.test_frac,
+        )
 
     model = HandGestureNet(in_channels=4, n_classes=10, B=2).to(device)
     checkpoint = th.load(args.weights, map_location=device)
