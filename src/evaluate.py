@@ -2,7 +2,8 @@ import torch as th
 import argparse
 from pathlib import Path
  
-from dataloader import get_dataLoaders
+from torch.utils.data import DataLoader
+from dataloader import get_dataLoaders, HandGestureDataset
 from model import HandGestureNet
 from utils import compute_intersection_over_union, extract_best_pred_box, extract_gt_box
 
@@ -115,7 +116,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--n-val-persons", type=int, default=5)
+    parser.add_argument("--val-frac", type=float, default=0.1)
+    parser.add_argument("--test-frac", type=float, default=0.1)
     parser.add_argument("--iou-thresh", type=float, default=0.5)
+    # For an EXTERNAL test set: use every person in --data-root, no splitting
+    parser.add_argument("--all-data", action="store_true")
     # MUST match the seed used in training, otherwise the person split
     # changes and "validation" persons leak from the training set
     parser.add_argument("--seed", type=int, default=42)
@@ -124,16 +129,24 @@ def main():
     device = th.device("cuda" if th.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
  
-    # Same split as training (same seed -> same val persons)
-    _, _, test_loader = get_dataLoaders(
-        args.data_root,
-        batch_size=args.batch_size,
-        n_val_persons=args.n_val_persons,
-        seed=args.seed,
-        num_workers=args.num_workers,
-        val_frac=args.val_frac,
-        test_frac=args.test_frac,
-    )
+    if args.all_data:
+        # External test set: EVERYTHING in data-root is test data, no split.
+        # No augmentation, no shuffle — same rules as any evaluation.
+        test_ds = HandGestureDataset(args.data_root, person_ids=None, augment=False, use_depth=True)
+        test_loader = DataLoader(test_ds, args.batch_size, shuffle=False,
+                                 num_workers=args.num_workers, pin_memory=True)
+        print(f"External test set: {len(test_ds)} images, ALL persons used")
+    else:
+        # Internal split: same seed as training -> same held-out test person
+        _, _, test_loader = get_dataLoaders(
+            args.data_root,
+            batch_size=args.batch_size,
+            n_val_persons=args.n_val_persons,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            val_frac=args.val_frac,
+            test_frac=args.test_frac,
+        )
  
     # Rebuild the empty model, then pour the trained weights back in
     model = HandGestureNet(in_channels=4, n_classes=10, B=2).to(device)
@@ -142,7 +155,7 @@ def main():
     print(f"Loaded {args.weights} (epoch {checkpoint.get('epoch', '?')}, "
           f"val_loss {checkpoint.get('val_loss', float('nan')):.4f})")
  
-    metrics = evaluate(model, val_loader, device, iou_thresh=args.iou_thresh)
+    metrics = evaluate(model, test_loader, device, iou_thresh=args.iou_thresh)
     print_report(metrics, iou_thresh=args.iou_thresh)
  
  
