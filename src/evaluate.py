@@ -2,8 +2,7 @@ import torch as th
 import argparse
 from pathlib import Path
  
-from torch.utils.data import DataLoader
-from dataloader import get_dataLoaders, HandGestureDataset
+from dataloader import get_dataLoaders
 from model import HandGestureNet
 from utils import compute_intersection_over_union, extract_best_pred_box, extract_gt_box
 
@@ -117,8 +116,6 @@ def main():
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--n-val-persons", type=int, default=5)
     parser.add_argument("--iou-thresh", type=float, default=0.5)
-    # For an EXTERNAL test set: use every person in --data-root, no splitting
-    parser.add_argument("--all-data", action="store_true")
     # MUST match the seed used in training, otherwise the person split
     # changes and "validation" persons leak from the training set
     parser.add_argument("--seed", type=int, default=42)
@@ -128,12 +125,14 @@ def main():
     print(f"Using device: {device}")
  
     # Same split as training (same seed -> same val persons)
-    _, val_loader = get_dataLoaders(
+    _, _, test_loader = get_dataLoaders(
         args.data_root,
         batch_size=args.batch_size,
         n_val_persons=args.n_val_persons,
         seed=args.seed,
         num_workers=args.num_workers,
+        val_frac=args.val_frac,
+        test_frac=args.test_frac,
     )
  
     # Rebuild the empty model, then pour the trained weights back in
