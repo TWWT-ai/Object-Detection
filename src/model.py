@@ -14,7 +14,7 @@ def conv_block(channel_in, channel_out, k=3, s=1):
 
 def res_stage(in_ch, out_ch):
     return nn.Sequential(
-        Residual(in_ch, out_ch, use_1x1conv=True, s=2),
+        Residual(in_ch, out_ch, use_1x1conv=True, strides=2),
         Residual(out_ch, out_ch),
     )
 
