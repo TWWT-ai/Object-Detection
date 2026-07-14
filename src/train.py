@@ -175,7 +175,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--lambda-seg", type=float, default=1.0)
     parser.add_argument("--lambda-cls", type=float, default=1.0)
     parser.add_argument("--lambda-det", type=float, default=1.0)
@@ -183,6 +183,9 @@ def main():
     parser.add_argument("--n-val-persons", type=int, default=5)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--test-frac", type=float, default=0.1)
+    # Checkpoint rule: cls_acc must improve AND seg/det val losses must stay
+    # within (1 + best-tol) of the best they have ever been
+    parser.add_argument("--best-tol", type=float, default=0.15)
     parser.add_argument("--out-dir", type=str, default="weights/")
     parser.add_argument("--seed", type=int, default=42)
     # Pack all the top argument into one
@@ -217,6 +220,8 @@ def main():
     output_directory = Path(args.out_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
     best_val_acc = 0.0
+    best_seg_loss = float("inf")
+    best_det_loss = float("inf")
     history = {"train_total": [], "val_total": [], "cls_acc": []}
     
     # Training loop
@@ -239,10 +244,18 @@ def main():
               f"(det {train_m['det']:.3f} | seg {train_m['seg']:.3f} | cls {train_m['cls']:.3f})  "
               f"val {val_m['total']:.4f}  cls_acc {val_m['cls_acc']:.3f}")
 
-        # Save on best val cls_acc, not val loss: with an unseen val person the
-        # loss can explode from confident wrong answers while accuracy still
-        # improves — loss-based saving froze us at a random-guessing epoch 23
-        if val_m["cls_acc"] > best_val_acc:
+        # Multi-task checkpoint rule (lexicographic with tolerance):
+        #   primary   — val cls_acc must beat the best so far
+        #   guardrail — val seg/det losses may fluctuate, but not more than
+        #               (1 + best_tol) of the best they have EVER been
+        # This stops us saving an epoch where classification improved but
+        # segmentation/detection quietly collapsed.
+        best_seg_loss = min(best_seg_loss, val_m["seg"])
+        best_det_loss = min(best_det_loss, val_m["det"])
+        seg_ok = val_m["seg"] <= best_seg_loss * (1 + args.best_tol)
+        det_ok = val_m["det"] <= best_det_loss * (1 + args.best_tol)
+
+        if val_m["cls_acc"] > best_val_acc and seg_ok and det_ok:
             best_val_acc = val_m["cls_acc"]
             th.save({
                 "epoch": epoch,
@@ -250,9 +263,16 @@ def main():
                 "optimizer_state": optimizer.state_dict(),
                 "val_loss": val_m["total"],
                 "val_cls_acc": best_val_acc,
+                "val_seg_loss": val_m["seg"],
+                "val_det_loss": val_m["det"],
                 "args": vars(args),
             }, output_directory / "best.pth")
-            print(f"  ↳ new best (cls_acc {best_val_acc:.3f}), checkpoint saved")
+            print(f"  ↳ new best (cls_acc {best_val_acc:.3f}, "
+                  f"seg {val_m['seg']:.3f}, det {val_m['det']:.3f}), checkpoint saved")
+        elif val_m["cls_acc"] > best_val_acc:
+            # cls improved but a guardrail failed — say so, don't save silently
+            print(f"  ↳ cls_acc improved to {val_m['cls_acc']:.3f} but "
+                  f"{'seg' if not seg_ok else 'det'} regressed beyond tolerance, NOT saved")
 
     # Save the best model/value overall
     th.save({"epoch": args.epochs, "model_state": model.state_dict()},
