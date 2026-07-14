@@ -18,6 +18,28 @@ def res_stage(in_ch, out_ch):
         Residual(out_ch, out_ch),
     )
 
+class CSPStage(nn.Module):
+    def __init__(self, in_ch, out_ch, n_blocks=2):
+        super().__init__()
+        self.down = conv_block(in_ch, out_ch, k=3, s=2)
+
+        mid = out_ch // 2
+        # 2) split
+        self.split_main = conv_block(out_ch, mid, k=1)
+        self.split_skip = conv_block(out_ch, mid, k=1)
+
+        # 3) 
+        self.blocks = nn.Sequential(*[Residual(mid, mid) for _ in range(n_blocks)])
+
+        # 4) 
+        self.fuse = conv_block(mid * 2, out_ch, k=1)
+
+    def forward(self, x):
+        x = self.down(x)
+        main = self.blocks(self.split_main(x))
+        skip = self.split_skip(x)
+        return self.fuse(th.cat([main, skip], dim=1))
+    
 
 class Residual(nn.Module):
     def __init__(self, input_channel, output_channel, use_1x1conv=False, strides=1):
@@ -47,12 +69,12 @@ class Backbone(nn.Module):
         super().__init__()
         # Reducing the pixels into 7x7 (448 / 2^6)
         # 7x7 being the box of determining the size of the grid cell
-        self.s1 = res_stage(in_channels, 32)
-        self.s2 = res_stage(32,  64)
-        self.s3 = res_stage(64,  128)
-        self.s4 = res_stage(128, 256)
-        self.s5 = res_stage(256, 512)
-        self.s6 = res_stage(512, 1024)
+        self.s1 = CSPStage(in_channels, 32, n_blocks=1)
+        self.s2 = CSPStage(32,  64, n_blocks=2)
+        self.s3 = CSPStage(64,  128, n_blocks=2)
+        self.s4 = CSPStage(128, 256, n_blocks=2)
+        self.s5 = CSPStage(256, 512, n_blocks=2)
+        self.s6 = CSPStage(512, 1024, n_blocks=1)
 
 
     def forward(self, x):
