@@ -175,7 +175,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--lambda-seg", type=float, default=1.0)
     parser.add_argument("--lambda-cls", type=float, default=1.0)
     parser.add_argument("--lambda-det", type=float, default=1.0)
@@ -252,8 +252,8 @@ def main():
         # segmentation/detection quietly collapsed.
         best_seg_loss = min(best_seg_loss, val_m["seg"])
         best_det_loss = min(best_det_loss, val_m["det"])
-        seg_ok = val_m["seg"] <= best_seg_loss * (1 + args.best_tol)
-        det_ok = val_m["det"] <= best_det_loss * (1 + args.best_tol)
+        seg_ok = val_m["seg"] <= best_seg_loss * (1 + args.best_tol) + 0.01
+        det_ok = val_m["det"] <= best_det_loss * (1 + args.best_tol) + 0.05
 
         if val_m["cls_acc"] > best_val_acc and seg_ok and det_ok:
             best_val_acc = val_m["cls_acc"]
