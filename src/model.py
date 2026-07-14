@@ -12,17 +12,47 @@ def conv_block(channel_in, channel_out, k=3, s=1):
     )
 
 
+def res_stage(in_ch, out_ch):
+    return nn.Sequential(
+        Residual(in_ch, out_ch, use_1x1conv=True, s=2),
+        Residual(out_ch, out_ch),
+    )
+
+
+class Residual(nn.Module):
+    def __init__(self, input_channel, output_channel, use_1x1conv=False, strides=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(input_channel, output_channel, kernel_size=3, padding=1, stride=strides)
+        self.conv2 = nn.Conv2d(output_channel, output_channel, kernel_size=3, padding=1)
+        if use_1x1conv:
+            self.conv3 = nn.Conv2d(input_channel, output_channel, kernel_size=1, stride=strides)
+        else:
+            self.conv3 = None
+        self.batch_norm1 = nn.BatchNorm2d(output_channel)
+        self.batch_norm2 = nn.BatchNorm2d(output_channel)
+        self.leaky_relu = nn.LeakyReLU(inplace=True)
+
+
+    def forward(self, X):
+        Y = F.leaky_relu(self.batch_norm1(self.conv1(X)), 0.1)
+        Y = self.batch_norm2(self.conv2(Y))
+        if self.conv3:
+            X = self.conv3(X)
+        Y += X
+        return F.leaky_relu(Y)
+
+
 class Backbone(nn.Module):
     def __init__(self, in_channels=4):
         super().__init__()
         # Reducing the pixels into 7x7 (448 / 2^6)
         # 7x7 being the box of determining the size of the grid cell
-        self.s1 = nn.Sequential(conv_block(in_channels, 32, s=2), conv_block(32, 32))
-        self.s2 = nn.Sequential(conv_block(32, 64, s=2), conv_block(64, 64))
-        self.s3 = nn.Sequential(conv_block(64, 128, s=2), conv_block(128, 128))
-        self.s4 = nn.Sequential(conv_block(128, 256, s=2), conv_block(256, 256))
-        self.s5 = nn.Sequential(conv_block(256, 512, s=2), conv_block(512, 512))
-        self.s6 = nn.Sequential(conv_block(512, 1024, s=2), conv_block(1024, 1024))
+        self.s1 = res_stage(in_channels, 32)
+        self.s2 = res_stage(32,  64)
+        self.s3 = res_stage(64,  128)
+        self.s4 = res_stage(128, 256)
+        self.s5 = res_stage(256, 512)
+        self.s6 = res_stage(512, 1024)
 
 
     def forward(self, x):
