@@ -188,6 +188,8 @@ def main():
     parser.add_argument("--best-tol", type=float, default=0.15)
     parser.add_argument("--out-dir", type=str, default="weights/")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--patience", type=int, default=15,
+                    help="连续 patience 轮没刷新最佳 cls_acc 就提前停")
     # Pack all the top argument into one
     args = parser.parse_args()
 
@@ -220,6 +222,7 @@ def main():
     output_directory = Path(args.out_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
     best_val_acc = 0.0
+    epochs_no_improve = 0 
     best_seg_loss = float("inf")
     best_det_loss = float("inf")
     history = {"train_total": [], "val_total": [], "cls_acc": []}
@@ -250,29 +253,33 @@ def main():
         #               (1 + best_tol) of the best they have EVER been
         # This stops us saving an epoch where classification improved but
         # segmentation/detection quietly collapsed.
+        improved = val_m["cls_acc"] > best_val_acc
         best_seg_loss = min(best_seg_loss, val_m["seg"])
         best_det_loss = min(best_det_loss, val_m["det"])
         seg_ok = val_m["seg"] <= best_seg_loss * (1 + args.best_tol) + 0.01
         det_ok = val_m["det"] <= best_det_loss * (1 + args.best_tol) + 0.05
 
-        if val_m["cls_acc"] > best_val_acc and seg_ok and det_ok:
+        if improved and seg_ok and det_ok:
             best_val_acc = val_m["cls_acc"]
+            epochs_no_improve = 0                    # 刷新最佳 -> 计数清零
             th.save({
-                "epoch": epoch,
-                "model_state": model.state_dict(),
+                "epoch": epoch, "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "val_loss": val_m["total"],
-                "val_cls_acc": best_val_acc,
-                "val_seg_loss": val_m["seg"],
-                "val_det_loss": val_m["det"],
+                "val_loss": val_m["total"], "val_cls_acc": best_val_acc,
+                "val_seg_loss": val_m["seg"], "val_det_loss": val_m["det"],
                 "args": vars(args),
             }, output_directory / "best.pth")
-            print(f"  ↳ new best (cls_acc {best_val_acc:.3f}, "
-                  f"seg {val_m['seg']:.3f}, det {val_m['det']:.3f}), checkpoint saved")
-        elif val_m["cls_acc"] > best_val_acc:
-            # cls improved but a guardrail failed — say so, don't save silently
-            print(f"  ↳ cls_acc improved to {val_m['cls_acc']:.3f} but "
-                  f"{'seg' if not seg_ok else 'det'} regressed beyond tolerance, NOT saved")
+            print(f"  ↳ new best (cls_acc {best_val_acc:.3f}), saved")
+        else:
+            epochs_no_improve += 1                    # 没刷新 -> 计数 +1
+            if improved:
+                print(f"  ↳ cls_acc up but {'seg' if not seg_ok else 'det'} "
+                      f"regressed, NOT saved")
+
+        if epochs_no_improve >= args.patience:        # 触发提前停止
+            print(f"Early stopping @ epoch {epoch} "
+                  f"(best cls_acc {best_val_acc:.3f})")
+            break
 
     # Save the best model/value overall
     th.save({"epoch": args.epochs, "model_state": model.state_dict()},
