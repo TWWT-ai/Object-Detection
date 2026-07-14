@@ -26,7 +26,9 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
     # n_val_persons is IGNORED (kept in the signature so old callers don't break).
     # Split is by PERSON -> no leakage between splits.
     n = len(persons)
-    n_test = max(1, round(n * test_frac))
+    # test_frac=0 means "no internal test person" — used for the final all-in
+    # model when an EXTERNAL test set does the final scoring
+    n_test = max(1, round(n * test_frac)) if test_frac > 0 else 0
     n_val = max(1, round(n * val_frac))
     n_val = min(n_val, n - n_test - 1)             # keep at least 1 person for train
     test_ids = set(persons[:n_test])
@@ -46,7 +48,9 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
     # Datasets
     train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_flip=True, use_depth=True)
     val_ds = HandGestureDataset(root, person_ids=val_ids, augment=False, use_depth=True)
-    test_ds = HandGestureDataset(root, person_ids=test_ids, augment=False, use_depth=True)
+    # No internal test persons (test_frac=0) -> reuse val as a placeholder so
+    # the 3-loader interface stays intact; final scoring happens externally
+    test_ds = HandGestureDataset(root, person_ids=test_ids, augment=False, use_depth=True) if test_ids else val_ds
 
     # Loading Data
     train_loader = DataLoader(train_ds, batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
