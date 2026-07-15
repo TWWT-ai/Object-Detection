@@ -19,80 +19,92 @@ S = 7
 
 def yolo_detection_loss(prediction, target, B=2,
                         lambda_coord=5.0, lambda_noobj=0.5):
+    """
+    YOLOv1-style loss for one hand class.
+
+    prediction: [N, S, S, B * 5]
+    target:     [N, S, S, 5]
+    box format: (cx, cy, w, h, confidence)
+    """
     N = prediction.size(0)
 
-    # [N, 7, 7, B * 5] -> [N, 7, 7, B, 5]
-    raw_prediction = prediction.view(N, S, S, B, 5)
+    # [N, S, S, B * 5] -> [N, S, S, B, 5]
+    prediction = prediction.view(N, S, S, B, 5)
 
-    # Keep coordinates and confidence in valid normalised ranges.
-    # If added, apply the same conversion before visualising predictions.
-    prediction = th.cat([
-        th.sigmoid(raw_prediction[..., 0:2]),  # x, y
-        th.sigmoid(raw_prediction[..., 2:4]),  # w, h
-        th.sigmoid(raw_prediction[..., 4:5]),  # confidence
-    ], dim=-1)
-
+    # Cells containing a hand versus empty cells
     object_mask = target[..., 4] > 0.5
     no_object_mask = ~object_mask
 
-    # 1. Empty cells: both candidate boxes should have confidence = 0.
-    empty_confidence = prediction[no_object_mask][..., 4]
+    # All B candidate boxes in empty cells should predict confidence = 0.
+    no_object_confidence = prediction[no_object_mask][..., 4]
     loss_no_object = F.mse_loss(
-        empty_confidence,
-        th.zeros_like(empty_confidence),
+        no_object_confidence,
+        th.zeros_like(no_object_confidence),
         reduction="sum",
     )
 
+    # Safe fallback if an image has no hand annotation
     if not object_mask.any():
         return lambda_noobj * loss_no_object / N
 
-    # One object cell per image in this dataset.
-    object_prediction = prediction[object_mask]  # [M, B, 5]
-    object_target = target[object_mask]          # [M, 5]
+    # Object cells:
+    # prediction_object: [number_of_object_cells, B, 5]
+    # target_object:     [number_of_object_cells, 5]
+    prediction_object = prediction[object_mask]
+    target_object = target[object_mask]
 
-    # 2. Pick the one candidate box responsible for this hand.
+    # Select the candidate box with greatest IoU as the responsible box.
     ious = compute_intersection_over_union(
-        object_prediction[..., :4],
-        object_target[:, None, :4],
+        prediction_object[..., :4],
+        target_object[:, None, :4],
     )
     best_iou, best_idx = ious.max(dim=1)
 
-    responsible_box = object_prediction[
-        th.arange(object_prediction.size(0), device=prediction.device),
+    responsible_box = prediction_object[
+        th.arange(prediction_object.size(0), device=prediction.device),
         best_idx,
     ]
 
-    # 3. The other candidate box in an object cell is also "no object".
-    responsible_mask = F.one_hot(best_idx, num_classes=B).bool()
-    non_responsible_confidence = object_prediction[..., 4][~responsible_mask]
-    loss_no_object += F.mse_loss(
-        non_responsible_confidence,
-        th.zeros_like(non_responsible_confidence),
+    # The other candidate box in the same object cell is not responsible,
+    # therefore its confidence should also be zero.
+    if B > 1:
+        responsible_mask = F.one_hot(best_idx, num_classes=B).bool()
+        non_responsible_confidence = prediction_object[..., 4][~responsible_mask]
+
+        loss_no_object += F.mse_loss(
+            non_responsible_confidence,
+            th.zeros_like(non_responsible_confidence),
+            reduction="sum",
+        )
+
+    # Responsible-box coordinate loss
+    loss_xy = F.mse_loss(
+        responsible_box[:, 0:2],
+        target_object[:, 0:2],
         reduction="sum",
     )
 
-    # 4. Coordinate loss for the responsible box only.
-    loss_xy = F.mse_loss(
-        responsible_box[:, :2], object_target[:, :2], reduction="sum"
-    )
+    # Square-root size loss, as used in classic YOLOv1
     loss_wh = F.mse_loss(
         th.sqrt(responsible_box[:, 2:4].clamp(min=1e-6)),
-        th.sqrt(object_target[:, 2:4].clamp(min=1e-6)),
+        th.sqrt(target_object[:, 2:4].clamp(min=1e-6)),
         reduction="sum",
     )
 
-    # 5. Classic YOLO confidence target = IoU of the responsible box.
+    # Responsible confidence should approximate its IoU with the target.
     loss_confidence = F.mse_loss(
         responsible_box[:, 4],
         best_iou.detach(),
         reduction="sum",
     )
 
-    return (
+    total_loss = (
         lambda_coord * (loss_xy + loss_wh)
         + loss_confidence
         + lambda_noobj * loss_no_object
-    ) / N
+    )
+
+    return total_loss / N
 
 
 def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0):
