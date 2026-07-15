@@ -263,7 +263,7 @@ def main():
         seg_ok = val_m["seg"] <= best_seg_loss * (1 + args.best_tol) + 0.01
         det_ok = val_m["det"] <= best_det_loss * (1 + args.best_tol) + 0.05
 
-        if seg_ok and det_ok:
+        if seg_ok or det_ok:
             # best_val_acc = val_m["cls_acc"]
             th.save({
                 "epoch": epoch,
