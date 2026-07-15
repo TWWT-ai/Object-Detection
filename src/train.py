@@ -17,56 +17,82 @@ S = 7
 # Loss Function
 #---------------------------------------------------
 
-def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=0.5):
-    """
-        Steps:
-        1. Split cells into two groups -> 
-        2. Push confidence toward zero for no-object cells ->
-        3. Responsible-box selection ->
-        4. Computing the three loss term: xy, wh, conf ->
-        5. Weighted sum
-    """
-
+def yolo_detection_loss(prediction, target, B=2,
+                        lambda_coord=5.0, lambda_noobj=0.5):
     N = prediction.size(0)
-    # Unzip the combined last index back to Box (B) and (x, y, w, h, confidence)
-    prediction = prediction.view(N, S, S, B, 5)
 
-    # Detect whether there is an object within the boxes
+    # [N, 7, 7, B * 5] -> [N, 7, 7, B, 5]
+    raw_prediction = prediction.view(N, S, S, B, 5)
+
+    # Keep coordinates and confidence in valid normalised ranges.
+    # If added, apply the same conversion before visualising predictions.
+    prediction = th.cat([
+        th.sigmoid(raw_prediction[..., 0:2]),  # x, y
+        th.sigmoid(raw_prediction[..., 2:4]),  # w, h
+        th.sigmoid(raw_prediction[..., 4:5]),  # confidence
+    ], dim=-1)
+
     object_mask = target[..., 4] > 0.5
-    no_object_mask = ~object_mask             # Flipping the mask
+    no_object_mask = ~object_mask
 
-    # Selecting total numbers of all the boxes with the object and the confidence of the object
-    no_object_conf = prediction[no_object_mask][..., 4]
-    # Creating a no_object_conf size like (assumed correct answer) but filled with 0, containing all cells without object
-    # Anything not equal to 0 will be considered loss/wrong prediction, to reduce the falseness reflected on to the last model
-    loss_no_object = F.mse_loss(no_object_conf, th.zeros_like(no_object_conf), reduction="sum")
-
-    if object_mask.sum() == 0:
-        # Safety check
-        return lambda_noobj * loss_no_object / N
-
-    # If there is something within the box
-    prediction_object = prediction[object_mask]
-    target_object = target[object_mask]
-
-    inter_over_unions = compute_intersection_over_union(prediction_object[..., :4], target_object[:, None, : 4])
-    best_iou, best_idx = inter_over_unions.max(dim=1)
-
-    # Fancy indexing: using the selected best 
-    response = prediction_object[th.arange(prediction_object.size(0)), best_idx]
-
-    # Calculating loss 
-    loss_xy = F.mse_loss(response[:, 0:2], target_object[:, 0:2], reduction="sum")
-    # Square root would punish small boundary boxes more 
-    loss_wh = F.mse_loss(
-        th.sqrt(response[:, 2:4].clamp(min=1e-6)),
-        th.sqrt(target_object[:, 2:4].clamp(min=1e-6)),
+    # 1. Empty cells: both candidate boxes should have confidence = 0.
+    empty_confidence = prediction[no_object_mask][..., 4]
+    loss_no_object = F.mse_loss(
+        empty_confidence,
+        th.zeros_like(empty_confidence),
         reduction="sum",
     )
-    loss_confidence = F.mse_loss(response[:, 4], best_iou.detach(), reduction="sum")
 
-    # Returning Multi Part loss function
-    return (lambda_coord * (loss_xy + loss_wh) + loss_confidence + lambda_noobj * loss_no_object) / N
+    if not object_mask.any():
+        return lambda_noobj * loss_no_object / N
+
+    # One object cell per image in this dataset.
+    object_prediction = prediction[object_mask]  # [M, B, 5]
+    object_target = target[object_mask]          # [M, 5]
+
+    # 2. Pick the one candidate box responsible for this hand.
+    ious = compute_intersection_over_union(
+        object_prediction[..., :4],
+        object_target[:, None, :4],
+    )
+    best_iou, best_idx = ious.max(dim=1)
+
+    responsible_box = object_prediction[
+        th.arange(object_prediction.size(0), device=prediction.device),
+        best_idx,
+    ]
+
+    # 3. The other candidate box in an object cell is also "no object".
+    responsible_mask = F.one_hot(best_idx, num_classes=B).bool()
+    non_responsible_confidence = object_prediction[..., 4][~responsible_mask]
+    loss_no_object += F.mse_loss(
+        non_responsible_confidence,
+        th.zeros_like(non_responsible_confidence),
+        reduction="sum",
+    )
+
+    # 4. Coordinate loss for the responsible box only.
+    loss_xy = F.mse_loss(
+        responsible_box[:, :2], object_target[:, :2], reduction="sum"
+    )
+    loss_wh = F.mse_loss(
+        th.sqrt(responsible_box[:, 2:4].clamp(min=1e-6)),
+        th.sqrt(object_target[:, 2:4].clamp(min=1e-6)),
+        reduction="sum",
+    )
+
+    # 5. Classic YOLO confidence target = IoU of the responsible box.
+    loss_confidence = F.mse_loss(
+        responsible_box[:, 4],
+        best_iou.detach(),
+        reduction="sum",
+    )
+
+    return (
+        lambda_coord * (loss_xy + loss_wh)
+        + loss_confidence
+        + lambda_noobj * loss_no_object
+    ) / N
 
 
 def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0):
