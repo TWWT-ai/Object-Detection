@@ -228,10 +228,10 @@ def main():
                 print(f"  ↳ cls_acc up but {'seg' if not seg_ok else 'det'} "
                       f"regressed, NOT saved")
 
-        if epochs_no_improve >= args.patience:        # 触发提前停止
-            print(f"Early stopping @ epoch {epoch} "
-                  f"(best cls_acc {best_val_acc:.3f})")
-            break
+        # if epochs_no_improve >= args.patience:        # 触发提前停止
+        #     print(f"Early stopping @ epoch {epoch} "
+        #           f"(best cls_acc {best_val_acc:.3f})")
+        #     break
 
     # Save the best model/value overall
     th.save({"epoch": args.epochs, "model_state": model.state_dict()},
