@@ -1,82 +1,74 @@
 import torch as th
 import torch.nn as nn
-import torch.nn.functional as F
-
 from utils import compute_intersection_over_union
 
 
 class YOLOLoss(nn.Module):
-    """YOLO-v1-style loss for a detection-only head with B boxes per grid cell.
-
-    ``predictions`` is [N, S, S, B * 5] and ``target`` is [N, S, S, 5], where
-    each target entry is [centre_x, centre_y, width, height, objectness].
-    Classification is intentionally not included: HandGestureNet has a separate
-    image-level classification head trained with CrossEntropyLoss.
-    """
-
-    def __init__(self, S=7, B=2, lambda_coord=5.0, lambda_noobj=0.5):
-        super().__init__()
+    def __init__(self, S=7, B=2, C=10):
+        super(YOLOLoss, self).__init__()
+        self.mse = nn.MSELoss(reduction="sum")
         self.S = S
         self.B = B
-        self.lambda_coord = lambda_coord
-        self.lambda_noobj = lambda_noobj
+        self.C = C
+        self.lambda_noobj = 0.5
+        self.lambda_coord = 5
 
     def forward(self, predictions, target):
-        batch_size = predictions.size(0)
-        expected_shape = (batch_size, self.S, self.S, self.B * 5)
-        if tuple(predictions.shape) != expected_shape:
-            raise ValueError(
-                f"Expected detection predictions shaped {expected_shape}, "
-                f"but received {tuple(predictions.shape)}."
-            )
-        if tuple(target.shape) != (batch_size, self.S, self.S, 5):
-            raise ValueError(
-                f"Expected detection targets shaped {(batch_size, self.S, self.S, 5)}, "
-                f"but received {tuple(target.shape)}."
-            )
+        predictions = predictions.reshape(-1, self.S, self.S, self.B * 5 + self.C)
+        iou_box1 = compute_intersection_over_union(predictions[..., 21:25], target[..., 21:25])
+        iou_box2 = compute_intersection_over_union(predictions[..., 26:30], target[..., 21:25])
+        ious = th.cat([iou_box1.unsqueeze(0), iou_box2.unsqueeze(0)], dim=0)
+        iou_maxes, best_box = th.max(ious, dim=0)
+        exist_box = target[..., 20].unsqueeze(3)      #identity of obj_i
 
-        predicted_boxes = predictions.view(batch_size, self.S, self.S, self.B, 5)
-        target_box = target[..., :4]
-        object_mask = target[..., 4:5]
+        # ======================= Box coordinates ================================
 
-        # Choose the candidate box that currently overlaps the target best.
-        ious = compute_intersection_over_union(
-            predicted_boxes[..., :4], target_box.unsqueeze(-2)
-        )
-        best_iou, best_box_index = ious.max(dim=-1, keepdim=True)
-        responsible_box = F.one_hot(best_box_index.squeeze(-1), num_classes=self.B).unsqueeze(-1)
-        responsible_box = responsible_box.to(dtype=predictions.dtype)
-        responsible_object = object_mask.unsqueeze(-2) * responsible_box
+        box_predictions = exist_box * ((
+                                    best_box * predictions[..., 26:30] +
+                                    (1 - best_box) * predictions[..., 21:25]
+                                    ))
+        box_targets = exist_box * target[..., 21:25]
 
-        responsible_prediction = (responsible_box * predicted_boxes[..., :4]).sum(dim=-2)
-        xy_loss = F.mse_loss(
-            object_mask * responsible_prediction[..., :2],
-            object_mask * target_box[..., :2],
-            reduction="sum",
-        )
-        wh_loss = F.mse_loss(
-            object_mask * th.sign(responsible_prediction[..., 2:4])
-            * th.sqrt(responsible_prediction[..., 2:4].abs() + 1e-6),
-            object_mask * th.sqrt(target_box[..., 2:4].clamp_min(0.0)),
-            reduction="sum",
-        )
+        box_predictions[..., 2:4] = th.sign(box_predictions[..., 2:4]) * th.sqrt(th.abs(box_predictions[..., 2:4] + 1e-6))
+        # N, S, S, 25
+        box_targets[..., 2:4] = th.sqrt(box_targets[..., 2:4])
 
-        # Only the responsible candidate predicts the IoU confidence in cells
-        # containing an object. Every other candidate is trained toward zero.
-        object_loss = F.mse_loss(
-            responsible_object * predicted_boxes[..., 4:5],
-            responsible_object * best_iou.detach().unsqueeze(-1),
-            reduction="sum",
-        )
-        no_object_mask = 1.0 - responsible_object
-        no_object_loss = F.mse_loss(
-            no_object_mask * predicted_boxes[..., 4:5],
-            th.zeros_like(predicted_boxes[..., 4:5]),
-            reduction="sum",
-        )
+        box_loss = self.mse(th.flatten(box_predictions, end_dim=-2),
+                            th.flatten(box_predictions, end_dim=-2)
+                            )
 
-        return (
-            self.lambda_coord * (xy_loss + wh_loss)
+        # ======================= Object loss ================================
+        pred_box = (best_box * predictions[..., 25:26] + (1 - best_box) * predictions[..., 20:21])
+        object_loss = self.mse(
+                            th.flatten(exist_box * pred_box),
+                            th.flatten(exist_box * target[..., 20:21])
+                            )
+
+        # ======================= No Object loss ================================
+        # Box 1
+        no_object_loss = self.mse(
+                            th.flatten((1 - exist_box) * predictions[..., 20:21], start_dim=1),
+                            th.flatten((1 - exist_box)  * target[..., 20:21], start_dim=1)
+                            )
+
+        # Box 2
+        no_object_loss += self.mse(
+                            th.flatten((1 - exist_box) * predictions[..., 25:26], start_dim=1),
+                            th.flatten((1 - exist_box)  * target[..., 20:21], start_dim=1)
+                            )
+
+        # ======================= Class Loss ================================
+
+        class_loss = self.mse(
+                            th.flatten(exist_box * predictions[..., :20], end_dim=2),
+                            th.flatten(exist_box * target[..., :20], end_dim=2)
+                            )
+
+        loss = (
+            self.lambda_coord * box_loss
             + object_loss
             + self.lambda_noobj * no_object_loss
-        ) / batch_size
+            + class_loss
+        )
+
+        return loss

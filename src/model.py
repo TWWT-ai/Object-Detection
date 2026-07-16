@@ -2,110 +2,120 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
+architecture_config = [
+    # Not including fully connected head
+    # (kernel, number of filters, stride, padding)
+    (7, 64, 2, 3),
+    "M",
+    (3, 192, 1, 1),
+    "M",
+    (1, 128, 1, 0),
+    (3, 256, 1, 1),
+    (1, 256, 1, 0),
+    (3, 512, 1, 1),
+    "M",
+    # Values inside tuple are the same, last index is the number of repeatition
+    [(1, 256, 1, 0), (3, 512, 1, 1), 4],
+    (1, 512, 1, 0),
+    (3, 1024, 1, 1),
+    "M",
+    [(1, 512, 1, 0), (3, 1024, 1, 1), 2],
+    (3, 1024, 1, 1),
+    (3, 1024, 2, 1),
+    (3, 1024, 1, 1),
+    (3, 1024, 1, 1),
+]
 
-def conv_block(in_channels, out_channels, kernel_size=3, stride=1):
-    """Convolution, batch normalisation, and LeakyReLU used by every encoder block."""
-    return nn.Sequential(
-        nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=kernel_size // 2,
-            bias=False,
-        ),
-        nn.BatchNorm2d(out_channels),
-        nn.LeakyReLU(0.1, inplace=True),
-    )
 
-
-class Backbone(nn.Module):
-    """Shared RGB-D encoder. A 448 x 448 image becomes a 7 x 7 feature map."""
-
-    def __init__(self, in_channels=4):
-        super().__init__()
-        self.stage1 = nn.Sequential(conv_block(in_channels, 32, stride=2), conv_block(32, 32))
-        self.stage2 = nn.Sequential(conv_block(32, 64, stride=2), conv_block(64, 64))
-        self.stage3 = nn.Sequential(conv_block(64, 128, stride=2), conv_block(128, 128))
-        self.stage4 = nn.Sequential(conv_block(128, 256, stride=2), conv_block(256, 256))
-        self.stage5 = nn.Sequential(conv_block(256, 512, stride=2), conv_block(512, 512))
-        self.stage6 = nn.Sequential(conv_block(512, 1024, stride=2), conv_block(1024, 1024))
+class CNNBlock(nn.Module):
+    def __init__(self, in_channel, out_channel, **kwargs):
+        super(CNNBlock, self).__init__()
+        self.conv = nn.Conv2d(in_channel, out_channel, bias=False, **kwargs)
+        self.batch_norm = nn.BatchNorm2d(out_channel)
+        self.leaky_relu = nn.LeakyReLU(0.1, inplace=True)
 
     def forward(self, x):
-        f224 = self.stage1(x)
-        f112 = self.stage2(f224)
-        f56 = self.stage3(f112)
-        f28 = self.stage4(f56)
-        f14 = self.stage5(f28)
-        f7 = self.stage6(f14)
-        return f56, f28, f14, f7
+        return self.leaky_relu(self.batch_norm(self.conv(x)))
 
 
-class DetectionHead(nn.Module):
-    """Returns B candidate boxes per cell in [N, 7, 7, B * 5] layout."""
+class YOLOv1(nn.Module):
+    def __init__(self, in_channels=4, **kwargs):
+        super(YOLOv1, self).__init__()
+        self.architecture = architecture_config
+        self.in_channels = in_channels
+        self.darknet = self._create_conv_layers(self.architecture)
+        self.fully_connected = self._create_fc(**kwargs)
 
-    def __init__(self, num_boxes=2):
-        super().__init__()
-        self.net = nn.Sequential(
-            conv_block(1024, 512),
-            nn.Conv2d(512, num_boxes * 5, kernel_size=1),
-        )
+    def forward(self, x):
+        x = self.darknet(x)
+        return self.fully_connected(th.flatten(x, start_dim=1))
 
-    def forward(self, f7):
-        return self.net(f7).permute(0, 2, 3, 1).contiguous()
+    def _create_conv_layers(self, architecture):
+        layers = []
+        in_channels = self.in_channels
+        for x in architecture:
+            if type(x) == tuple:
+                layers += [
+                    CNNBlock(
+                        in_channels,
+                        out_channel=x[1],
+                        kernel_size=x[0],
+                        stride=x[2],
+                        padding=x[3]
+                    )
+                ]
+                in_channels = x[1]
+            elif type(x) == str:
+                layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+            elif type(x) == list:
+                conv1 = x[0]
+                conv2 = x[1]
+                num_repeat = x[-1]
 
+                for _ in range(num_repeat):
+                    layers += [
+                        CNNBlock(
+                            in_channels,
+                            out_channel=conv1[1],
+                            kernel_size=conv1[0],
+                            stride=conv1[2],
+                            padding=conv1[3]
+                        )
+                    ]
 
-class ClassificationHead(nn.Module):
-    def __init__(self, num_classes=10):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2048, 256),
-            nn.LeakyReLU(0.1, inplace=True),
+                    layers += [
+                        CNNBlock(
+                            conv1[1],
+                            out_channel=conv2[1],
+                            kernel_size=conv2[0],
+                            stride=conv2[2],
+                            padding=conv2[3]
+                        )
+                    ]
+                    in_channels = conv2[1]
+
+        return nn.Sequential(*layers)
+
+    def _create_fc(self, split_size, num_boxes, num_classes):
+        S, B, C = split_size, num_boxes, num_classes
+        return nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(1024 * S * S, 4096),  # For low vram use 496
             nn.Dropout(0.3),
-            nn.Linear(256, num_classes),
+            nn.LeakyReLU(0.1),
+            nn.Linear(4096, S * S * (B * 5 + C))
         )
 
-    def forward(self, f7):
-        average_features = F.adaptive_avg_pool2d(f7, 1).flatten(1)
-        maximum_features = F.adaptive_max_pool2d(f7, 1).flatten(1)
-        return self.net(th.cat([average_features, maximum_features], dim=1))
+
+def test(S=7, B=2, C=30):
+    model = YOLOv1(
+        in_channels=4,
+        split_size=S,
+        num_boxes=B,
+        num_classes=C
+    )
+    x = th.randn((2, 4, 448, 448))
+    print(model(x).shape)
 
 
-class SegmentationHead(nn.Module):
-    """Decoder with encoder skip connections; output is an unnormalised mask logit."""
-
-    def __init__(self):
-        super().__init__()
-        self.up1 = conv_block(1024 + 512, 256)
-        self.up2 = conv_block(256 + 256, 128)
-        self.up3 = conv_block(128 + 128, 64)
-        self.out = nn.Conv2d(64, 1, kernel_size=1)
-
-    def forward(self, f56, f28, f14, f7):
-        x = F.interpolate(f7, size=f14.shape[-2:], mode="bilinear", align_corners=False)
-        x = self.up1(th.cat([x, f14], dim=1))
-        x = F.interpolate(x, size=f28.shape[-2:], mode="bilinear", align_corners=False)
-        x = self.up2(th.cat([x, f28], dim=1))
-        x = F.interpolate(x, size=f56.shape[-2:], mode="bilinear", align_corners=False)
-        x = self.up3(th.cat([x, f56], dim=1))
-        x = F.interpolate(x, size=(448, 448), mode="bilinear", align_corners=False)
-        return self.out(x)
-
-
-class HandGestureNet(nn.Module):
-    """Shared RGB-D network for detection, segmentation, and gesture classification."""
-
-    def __init__(self, in_channels=4, n_classes=10, B=2):
-        super().__init__()
-        self.backbone = Backbone(in_channels)
-        self.detection_head = DetectionHead(B)
-        self.segmentation_head = SegmentationHead()
-        self.classification_head = ClassificationHead(n_classes)
-
-    def forward(self, x):
-        f56, f28, f14, f7 = self.backbone(x)
-        return (
-            self.detection_head(f7),
-            self.segmentation_head(f56, f28, f14, f7),
-            self.classification_head(f7),
-        )
+test()
