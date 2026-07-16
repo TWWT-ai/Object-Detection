@@ -107,7 +107,7 @@ class YOLOv1(nn.Module):
         )
 
 
-def test(S=7, B=2, C=30):
+def test(S=7, B=2, C=20):
     model = YOLOv1(
         in_channels=4,
         split_size=S,
@@ -118,4 +118,7 @@ def test(S=7, B=2, C=30):
     print(model(x).shape)
 
 
-test()
+# Guarded: without this, every `import model` (train/evaluate/visualize)
+# builds a throwaway 200M-param model and runs a CPU forward pass
+if __name__ == "__main__":
+    test()

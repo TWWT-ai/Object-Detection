@@ -29,8 +29,11 @@ def prepare_yolo_targets(detection_target, labels):
     batch_size = detection_target.size(0)
     target = detection_target.new_zeros(batch_size, S, S, B * 5 + C)
 
-    # loss.py reads objectness and the ground-truth box from positions 20:25.
-    target[..., 20:25] = detection_target
+    # loss.py layout is [C classes, CONFIDENCE@20, x@21, y@22, w@23, h@24] —
+    # confidence FIRST, box after. The dataloader stores [x, y, w, h, conf]
+    # (box first), so the two slices must be reordered, not copied as-is.
+    target[..., 20:21] = detection_target[..., 4:5]   # objectness -> index 20
+    target[..., 21:25] = detection_target[..., 0:4]   # cx,cy,w,h  -> 21..24
 
     object_mask = detection_target[..., 4:5]
     class_target = F.one_hot(labels, num_classes=C).to(detection_target.dtype)
