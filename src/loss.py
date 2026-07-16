@@ -46,11 +46,17 @@ class YOLOLoss(nn.Module):
         )
         box_targets = exist_box * target_box
 
-        box_predictions[..., 2:4] = (
+        # NOT in-place: slice-assignment would overwrite values autograd still
+        # needs for backward (RuntimeError: modified by an inplace operation).
+        # Build new tensors with cat instead.
+        pred_wh = (
             th.sign(box_predictions[..., 2:4])
             * th.sqrt(th.abs(box_predictions[..., 2:4]) + 1e-6)
         )
-        box_targets[..., 2:4] = th.sqrt(box_targets[..., 2:4].clamp(min=0.0))
+        box_predictions = th.cat([box_predictions[..., 0:2], pred_wh], dim=-1)
+
+        target_wh = th.sqrt(box_targets[..., 2:4].clamp(min=0.0))
+        box_targets = th.cat([box_targets[..., 0:2], target_wh], dim=-1)
 
         box_loss = self.mse(
             th.flatten(box_predictions, end_dim=-2),
