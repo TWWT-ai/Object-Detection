@@ -14,61 +14,97 @@ class YOLOLoss(nn.Module):
         self.lambda_coord = 5
 
     def forward(self, predictions, target):
-        predictions = predictions.reshape(-1, self.S, self.S, self.B * 5 + self.C)
-        iou_box1 = compute_intersection_over_union(predictions[..., 21:25], target[..., 21:25])
-        iou_box2 = compute_intersection_over_union(predictions[..., 26:30], target[..., 21:25])
-        ious = th.cat([iou_box1.unsqueeze(0), iou_box2.unsqueeze(0)], dim=0)
+        predictions = predictions.reshape(
+            -1, self.S, self.S, self.B * 5 + self.C
+        )
+
+        # Layout:
+        # [class scores (C), confidence_1, box_1 (x,y,w,h),
+        #  confidence_2, box_2 (x,y,w,h)]
+        confidence_1_index = self.C
+        box_1_start = self.C + 1
+        confidence_2_index = self.C + 5
+        box_2_start = self.C + 6
+
+        box_1 = predictions[..., box_1_start:box_1_start + 4]
+        box_2 = predictions[..., box_2_start:box_2_start + 4]
+        target_box = target[..., box_1_start:box_1_start + 4]
+
+        iou_box_1 = compute_intersection_over_union(box_1, target_box)
+        iou_box_2 = compute_intersection_over_union(box_2, target_box)
+
+        ious = th.stack([iou_box_1, iou_box_2], dim=0)
         iou_maxes, best_box = th.max(ious, dim=0)
-        exist_box = target[..., 20].unsqueeze(3)      #identity of obj_i
 
-        # ======================= Box coordinates ================================
+        # The extra final dimension allows multiplication with x/y/w/h tensors.
+        best_box = best_box.unsqueeze(3)
+        exist_box = target[..., confidence_1_index:confidence_1_index + 1]
 
-        box_predictions = exist_box * ((
-                                    best_box * predictions[..., 26:30] +
-                                    (1 - best_box) * predictions[..., 21:25]
-                                    ))
-        box_targets = exist_box * target[..., 21:25]
+        # ---------------- Box-coordinate loss ----------------
+        box_predictions = exist_box * (
+            best_box * box_2 + (1 - best_box) * box_1
+        )
+        box_targets = exist_box * target_box
 
-        box_predictions[..., 2:4] = th.sign(box_predictions[..., 2:4]) * th.sqrt(th.abs(box_predictions[..., 2:4] + 1e-6))
-        # N, S, S, 25
-        box_targets[..., 2:4] = th.sqrt(box_targets[..., 2:4])
+        box_predictions[..., 2:4] = (
+            th.sign(box_predictions[..., 2:4])
+            * th.sqrt(th.abs(box_predictions[..., 2:4]) + 1e-6)
+        )
+        box_targets[..., 2:4] = th.sqrt(box_targets[..., 2:4].clamp(min=0.0))
 
-        box_loss = self.mse(th.flatten(box_predictions, end_dim=-2),
-                            th.flatten(box_predictions, end_dim=-2)
-                            )
+        box_loss = self.mse(
+            th.flatten(box_predictions, end_dim=-2),
+            th.flatten(box_targets, end_dim=-2),
+        )
 
-        # ======================= Object loss ================================
-        pred_box = (best_box * predictions[..., 25:26] + (1 - best_box) * predictions[..., 20:21])
+        # ---------------- Object-confidence loss ----------------
+        predicted_confidence = (
+            best_box * predictions[..., confidence_2_index:confidence_2_index + 1]
+            + (1 - best_box)
+            * predictions[..., confidence_1_index:confidence_1_index + 1]
+        )
+
         object_loss = self.mse(
-                            th.flatten(exist_box * pred_box),
-                            th.flatten(exist_box * target[..., 20:21])
-                            )
+            th.flatten(exist_box * predicted_confidence),
+            th.flatten(exist_box * iou_maxes.unsqueeze(3).detach()),
+        )
 
-        # ======================= No Object loss ================================
-        # Box 1
+        # ---------------- No-object-confidence loss ----------------
         no_object_loss = self.mse(
-                            th.flatten((1 - exist_box) * predictions[..., 20:21], start_dim=1),
-                            th.flatten((1 - exist_box)  * target[..., 20:21], start_dim=1)
-                            )
+            th.flatten(
+                (1 - exist_box)
+                * predictions[..., confidence_1_index:confidence_1_index + 1],
+                start_dim=1,
+            ),
+            th.flatten(
+                (1 - exist_box)
+                * target[..., confidence_1_index:confidence_1_index + 1],
+                start_dim=1,
+            ),
+        )
 
-        # Box 2
         no_object_loss += self.mse(
-                            th.flatten((1 - exist_box) * predictions[..., 25:26], start_dim=1),
-                            th.flatten((1 - exist_box)  * target[..., 20:21], start_dim=1)
-                            )
+            th.flatten(
+                (1 - exist_box)
+                * predictions[..., confidence_2_index:confidence_2_index + 1],
+                start_dim=1,
+            ),
+            th.flatten(
+                (1 - exist_box)
+                * target[..., confidence_1_index:confidence_1_index + 1],
+                start_dim=1,
+            ),
+        )
 
-        # ======================= Class Loss ================================
-
+        # ---------------- Class loss ----------------
         class_loss = self.mse(
-                            th.flatten(exist_box * predictions[..., :20], end_dim=2),
-                            th.flatten(exist_box * target[..., :20], end_dim=2)
-                            )
+            th.flatten(exist_box * predictions[..., :self.C], end_dim=2),
+            th.flatten(exist_box * target[..., :self.C], end_dim=2),
+        )
 
-        loss = (
+        return (
             self.lambda_coord * box_loss
             + object_loss
             + self.lambda_noobj * no_object_loss
             + class_loss
         )
-
-        return loss
