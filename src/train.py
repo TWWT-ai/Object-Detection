@@ -172,9 +172,9 @@ def main():
         else:
             epochs_no_improve += 1
 
-        if epochs_no_improve >= args.patience:
-            print(f"Early stopping at epoch {epoch} (best detection loss {best_detection_loss:.4f})")
-            break
+        # if epochs_no_improve >= args.patience:
+        #     print(f"Early stopping at epoch {epoch} (best detection loss {best_detection_loss:.4f})")
+        #     break
 
     th.save(
         {"epoch": epoch, "model_state": model.state_dict(), "args": vars(args)},

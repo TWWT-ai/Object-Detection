@@ -37,6 +37,29 @@ def encode_yolo_target(boundary_box, s=S):
     return target
 
 
+def extract_yolo_prediction(pred, s=S, B=2, C=20):
+    """
+    Decoder for the YOLOv1 layout: each cell holds
+    [C class scores, conf_1, box_1(cx,cy,w,h), conf_2, box_2(cx,cy,w,h)].
+
+    pred: flat [S*S*(B*5+C)] or [S,S,B*5+C] for ONE image.
+    Returns (best box tensor [cx,cy,w,h], predicted class index).
+    Only the first 10 class slots are real gestures (C=20 pads with zeros).
+    """
+    pred = pred.view(s, s, B * 5 + C)
+
+    # Confidence of every box: index C for box 0, C+5 for box 1
+    confs = th.stack([pred[..., C], pred[..., C + 5]], dim=-1)   # [S, S, B]
+    flat_idx = confs.flatten().argmax()
+    row = flat_idx // (s * B)
+    col = (flat_idx % (s * B)) // B
+    b = flat_idx % B
+
+    box = pred[row, col, C + 1 + b * 5 : C + 5 + b * 5]
+    cls_idx = pred[row, col, :10].argmax()      # gesture lives in slots 0-9
+    return box, cls_idx
+
+
 def decode_predictions(prediction, B=2, conf_thresh=0.25, s=S):
     """
     Inverse of the model output: [S, S, B*5] (one image, after permute)
