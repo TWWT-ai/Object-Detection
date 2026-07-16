@@ -30,16 +30,21 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
     # model when an EXTERNAL test set does the final scoring
     n_test = max(1, round(n * test_frac)) if test_frac > 0 else 0
     n_val = max(1, round(n * val_frac))
-    n_val = min(n_val, n - n_test - 1)             # keep at least 1 person for train
+    # keep at least 1 person for train; never negative (1-person smoke tests)
+    n_val = max(0, min(n_val, n - n_test - 1))
     test_ids = set(persons[:n_test])
     val_ids = set(persons[n_test:n_test + n_val])
     train_ids = set(persons[n_test + n_val:])
 
-    # Smoke-test fallback: too few persons to split -> everyone plays all roles
+    # Smoke-test fallbacks: tiny datasets can leave a split empty
     if len(train_ids) == 0:
         print("WARNING: too few persons for a real split, "
               "using ALL persons for train/val/test (smoke test only)")
         train_ids = val_ids = test_ids = set(persons)
+    if len(val_ids) == 0:
+        print("WARNING: no persons left for val, reusing TRAIN persons "
+              "(overfit/smoke test only — val metrics are NOT generalization)")
+        val_ids = train_ids
 
     print(f"train persons: {sorted(train_ids)}")
     print(f"val persons:   {sorted(val_ids)}")
