@@ -2,113 +2,110 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
-def conv_block(channel_in, channel_out, k=3, s=1):
-    # s=1 only thickening, s=2 shrinking and thickening
+
+def conv_block(in_channels, out_channels, kernel_size=3, stride=1):
+    """Convolution, batch normalisation, and LeakyReLU used by every encoder block."""
     return nn.Sequential(
-        # Converting the picture into thinkened and shrinked picture
-        nn.Conv2d(channel_in, channel_out, k, stride=s, padding=(k // 2), bias=False),
-        nn.BatchNorm2d(channel_out),
-        nn.LeakyReLU(0.1, inplace=True)
+        nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=kernel_size // 2,
+            bias=False,
+        ),
+        nn.BatchNorm2d(out_channels),
+        nn.LeakyReLU(0.1, inplace=True),
     )
 
 
 class Backbone(nn.Module):
+    """Shared RGB-D encoder. A 448 x 448 image becomes a 7 x 7 feature map."""
+
     def __init__(self, in_channels=4):
         super().__init__()
-        # Reducing the pixels into 7x7 (448 / 2^6)
-        # 7x7 being the box of determining the size of the grid cell
-        self.s1 = nn.Sequential(conv_block(in_channels, 32, s=2), conv_block(32, 32))
-        self.s2 = nn.Sequential(conv_block(32, 64, s=2), conv_block(64, 64))
-        self.s3 = nn.Sequential(conv_block(64, 128, s=2), conv_block(128, 128))
-        self.s4 = nn.Sequential(conv_block(128, 256, s=2), conv_block(256, 256))
-        self.s5 = nn.Sequential(conv_block(256, 512, s=2), conv_block(512, 512))
-        self.s6 = nn.Sequential(conv_block(512, 1024, s=2), conv_block(1024, 1024))
-
+        self.stage1 = nn.Sequential(conv_block(in_channels, 32, stride=2), conv_block(32, 32))
+        self.stage2 = nn.Sequential(conv_block(32, 64, stride=2), conv_block(64, 64))
+        self.stage3 = nn.Sequential(conv_block(64, 128, stride=2), conv_block(128, 128))
+        self.stage4 = nn.Sequential(conv_block(128, 256, stride=2), conv_block(256, 256))
+        self.stage5 = nn.Sequential(conv_block(256, 512, stride=2), conv_block(512, 512))
+        self.stage6 = nn.Sequential(conv_block(512, 1024, stride=2), conv_block(1024, 1024))
 
     def forward(self, x):
-        # Forward pass to get data from size 7 to 56 and later hand to SegmentationHead to help to classify the border
-        # Mainly using s3 to s5 to calibrate the shape, therefore keeping the record all these data and ready to share backbone
-        f56 = self.s3(self.s2(self.s1(x)))
-        f28 = self.s4(f56)
-        f14 = self.s5(f28)
-        f7 = self.s6(f14)
+        f224 = self.stage1(x)
+        f112 = self.stage2(f224)
+        f56 = self.stage3(f112)
+        f28 = self.stage4(f56)
+        f14 = self.stage5(f28)
+        f7 = self.stage6(f14)
         return f56, f28, f14, f7
 
 
 class DetectionHead(nn.Module):
-    def __init__(self, B=2):
+    """Returns B candidate boxes per cell in [N, 7, 7, B * 5] layout."""
+
+    def __init__(self, num_boxes=2):
         super().__init__()
-        self.B = B
         self.net = nn.Sequential(
-            # Reforming 1024 of data into 512 constructed with newly mixed weights with lower weights become negligible
-            conv_block(1024, 512), 
-            # To determine the frame that actually lands on what we want
-            # Candidate box(possible box containing the object) * (x, y, w, h, conf) = B * 5
-            nn.Conv2d(512, B * 5, kernel_size=1) 
+            conv_block(1024, 512),
+            nn.Conv2d(512, num_boxes * 5, kernel_size=1),
         )
 
-
     def forward(self, f7):
-        output = self.net(f7)
-        # Convert back to the form which torch expects (batch, channel, height, width), (batch, 7, 7, 10)
-        return output.permute(0, 2, 3, 1)   # Number is the index
+        return self.net(f7).permute(0, 2, 3, 1).contiguous()
 
 
 class ClassificationHead(nn.Module):
-    def __init__(self, n_classes=10):
+    def __init__(self, num_classes=10):
         super().__init__()
-        # To classify which sign is the possible class we want (returns logit)
         self.net = nn.Sequential(
             nn.Linear(2048, 256),
             nn.LeakyReLU(0.1, inplace=True),
             nn.Dropout(0.3),
-            nn.Linear(256, n_classes),
+            nn.Linear(256, num_classes),
         )
 
-
     def forward(self, f7):
-        # Extracting from each block whether is contains the object
-        avg = F.adaptive_avg_pool2d(f7, 1).flatten(1)
-        mx = F.adaptive_max_pool2d(f7, 1).flatten(1)
-        return self.net(th.cat([avg, mx], dim=1))
-    
+        average_features = F.adaptive_avg_pool2d(f7, 1).flatten(1)
+        maximum_features = F.adaptive_max_pool2d(f7, 1).flatten(1)
+        return self.net(th.cat([average_features, maximum_features], dim=1))
+
+
 class SegmentationHead(nn.Module):
-    # Resizing back to input image size with suitable correction and modification
+    """Decoder with encoder skip connections; output is an unnormalised mask logit."""
+
     def __init__(self):
         super().__init__()
-        # Sticking back the channels
         self.up1 = conv_block(1024 + 512, 256)
         self.up2 = conv_block(256 + 256, 128)
         self.up3 = conv_block(128 + 128, 64)
-        # Converting the all 64 weight per pixel into one number
         self.out = nn.Conv2d(64, 1, kernel_size=1)
 
-
     def forward(self, f56, f28, f14, f7):
-        # Enlarging by scale factor 2
-        x = F.interpolate(f7, scale_factor=2)
-        # Following the channel(dimension 1) extend on it e.g. 1024 + 512 = 1536
+        x = F.interpolate(f7, size=f14.shape[-2:], mode="bilinear", align_corners=False)
         x = self.up1(th.cat([x, f14], dim=1))
-        x = F.interpolate(x, scale_factor=2)
+        x = F.interpolate(x, size=f28.shape[-2:], mode="bilinear", align_corners=False)
         x = self.up2(th.cat([x, f28], dim=1))
-        x = F.interpolate(x, scale_factor=2)
+        x = F.interpolate(x, size=f56.shape[-2:], mode="bilinear", align_corners=False)
         x = self.up3(th.cat([x, f56], dim=1))
         x = F.interpolate(x, size=(448, 448), mode="bilinear", align_corners=False)
         return self.out(x)
-    
+
 
 class HandGestureNet(nn.Module):
-    def __init__(self, in_channels=5, n_classes=10, B=2):
+    """Shared RGB-D network for detection, segmentation, and gesture classification."""
+
+    def __init__(self, in_channels=4, n_classes=10, B=2):
         super().__init__()
         self.backbone = Backbone(in_channels)
-        self.detecting_head = DetectionHead(B)
-        self.classification_head = ClassificationHead(n_classes)
+        self.detection_head = DetectionHead(B)
         self.segmentation_head = SegmentationHead()
+        self.classification_head = ClassificationHead(n_classes)
 
-    
     def forward(self, x):
         f56, f28, f14, f7 = self.backbone(x)
-        return (self.detecting_head(f7),
-                self.segmentation_head(f56, f28, f14, f7),
-                self.classification_head(f7)
-                )
+        return (
+            self.detection_head(f7),
+            self.segmentation_head(f56, f28, f14, f7),
+            self.classification_head(f7),
+        )
