@@ -32,7 +32,7 @@ class CNNBlock(nn.Module):
         super(CNNBlock, self).__init__()
         self.conv = nn.Conv2d(in_channel, out_channel, bias=False, **kwargs)
         self.batch_norm = nn.BatchNorm2d(out_channel)
-        self.leaky_relu = nn.LeakyReLU(0.1, inplace=True)
+        self.leaky_relu = nn.LeakyReLU(0.1, inplace=False)
 
     def forward(self, x):
         return self.leaky_relu(self.batch_norm(self.conv(x)))
