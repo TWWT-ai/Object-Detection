@@ -9,14 +9,32 @@ from utils import encode_yolo_target
 
 
 def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
-                    val_frac=0.1, test_frac=0.1):
+                    val_frac=0.1, test_frac=0.1, val_person=None):
     root = pathlib.Path(root)
 
-    # Merged layout: top-level folders are GESTURES (G01_call...), the person
-    # lives in the FILENAME PREFIX ("25040826_Guo__frame_005")
-    persons = sorted({p.stem.split("__")[0] for p in root.rglob("annotation/*png")})
+    # Two supported layouts, auto-detected per file:
+    #  merged:   root/GXX_x/clip/annotation/person__frame.png (person = prefix)
+    #  original: root/<person>/GXX_x/clip/annotation/frame.png (person = folder)
+    persons = set()
+    for p in root.rglob("annotation/*png"):
+        if "__" in p.stem:
+            persons.add(p.stem.split("__")[0])
+        else:
+            rel = p.relative_to(root).parts
+            persons.add(rel[0] if len(rel) >= 5 else root.name)
+    persons = sorted(persons)
     if not persons:
         raise RuntimeError(f"No annotation found under {root}")
+
+    # Explicitly named validation person: no shuffling, no test split —
+    # train on everyone else. Used for the "train on A, validate on B" setup.
+    if val_person is not None:
+        if val_person not in persons:
+            raise ValueError(f"val_person '{val_person}' not found, have: {persons}")
+        val_ids = {val_person}
+        test_ids = set()
+        train_ids = set(persons) - val_ids
+        return _build_loaders(root, train_ids, val_ids, test_ids, batch_size, num_workers)
 
     # Selecting people to load
     rng = np.random.default_rng(seed)
@@ -46,6 +64,10 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
               "(overfit/smoke test only — val metrics are NOT generalization)")
         val_ids = train_ids
 
+    return _build_loaders(root, train_ids, val_ids, test_ids, batch_size, num_workers)
+
+
+def _build_loaders(root, train_ids, val_ids, test_ids, batch_size, num_workers):
     print(f"train persons: {sorted(train_ids)}")
     print(f"val persons:   {sorted(val_ids)}")
     print(f"test persons:  {sorted(test_ids)}")
@@ -53,8 +75,8 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
     # Datasets
     train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_flip=True, use_depth=True)
     val_ds = HandGestureDataset(root, person_ids=val_ids, augment=False, use_depth=True)
-    # No internal test persons (test_frac=0) -> reuse val as a placeholder so
-    # the 3-loader interface stays intact; final scoring happens externally
+    # No internal test persons -> reuse val as a placeholder so the 3-loader
+    # interface stays intact; final scoring happens externally
     test_ds = HandGestureDataset(root, person_ids=test_ids, augment=False, use_depth=True) if test_ids else val_ds
 
     # Loading Data
@@ -81,9 +103,14 @@ class HandGestureDataset():
             clip_directory = mask_path.parent.parent
             gesture_directory = clip_directory.parent
 
-            # Merged layout: person is the filename prefix, not a folder
-            stem = mask_path.stem                 # e.g. 25040826_Guo__frame_005
-            person_id = stem.split("__")[0]       # 25040826_Guo
+            # Person: filename prefix (merged layout) or top-level folder
+            # (original layout), matching the detection in get_dataLoaders
+            stem = mask_path.stem
+            if "__" in stem:
+                person_id = stem.split("__")[0]
+            else:
+                rel = mask_path.relative_to(self.root).parts
+                person_id = rel[0] if len(rel) >= 5 else self.root.name
 
             # If the person is not in the list then pass
             if person_ids is not None and person_id not in person_ids:

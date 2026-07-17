@@ -20,7 +20,7 @@ def compute_intersection_over_union(box1, box2):
 
 def encode_yolo_target(boundary_box, s=S):
     x_min, y_min, x_max, y_max = [float(v) for v in boundary_box]
- 
+
     # Corner format -> centre format
     cx = (x_min + x_max) / 2.0
     cy = (y_min + y_max) / 2.0
@@ -31,9 +31,16 @@ def encode_yolo_target(boundary_box, s=S):
     # cx * s is in [0, s); int() floors it; min() guards the cx == 1.0 edge case
     col = min(int(cx * s), s - 1)     # column index <- x direction
     row = min(int(cy * s), s - 1)     # row index    <- y direction
-    
+
+    # CELL-RELATIVE x,y (YOLO paper convention): position of the centre
+    # WITHIN its cell, in [0, 1). The regression target becomes "fine-tune
+    # inside the cell" instead of "find an absolute position on the image".
+    # w, h stay image-relative.
+    x_cell = cx * s - col
+    y_cell = cy * s - row
+
     target = th.zeros(s, s, 5)
-    target[row, col] = th.tensor([cx, cy, w, h, 1.0])
+    target[row, col] = th.tensor([x_cell, y_cell, w, h, 1.0])
     return target
 
 
@@ -56,8 +63,13 @@ def extract_yolo_prediction(pred, s=S, B=2, C=20):
     b = flat_idx % B
 
     box = pred[row, col, C + 1 + b * 5 : C + 5 + b * 5]
+    # Mirror the loss: x,y are sigmoid-bounded cell offsets -> convert to
+    # GLOBAL coordinates using this box's cell indices. w,h stay as-is.
+    cx = (col + th.sigmoid(box[0])) / s
+    cy = (row + th.sigmoid(box[1])) / s
+    global_box = th.stack([cx, cy, box[2], box[3]])
     cls_idx = pred[row, col, :10].argmax()      # gesture lives in slots 0-9
-    return box, cls_idx
+    return global_box, cls_idx
 
 
 def decode_predictions(prediction, B=2, conf_thresh=0.25, s=S):
@@ -79,13 +91,18 @@ def decode_predictions(prediction, B=2, conf_thresh=0.25, s=S):
     boxes.sort(key=lambda box: box[4], reverse=True)
     return boxes
 
-def extract_gt_box(det_target):
+def extract_gt_box(det_target, s=S):
     """
     Inverse of encode_yolo_target for ONE image:
-    [S, S, 5] grid -> the single (cx, cy, w, h) stored in the object cell.
+    [S, S, 5] grid -> the single GLOBAL (cx, cy, w, h) of the object.
+    Undoes the cell-relative encoding using the cell indices.
     """
     object_mask = det_target[..., 4] > 0.5
-    return det_target[object_mask][0, :4]
+    row, col = [v.item() for v in object_mask.nonzero()[0]]
+    x_cell, y_cell, w, h = det_target[row, col, :4]
+    cx = (col + x_cell) / s
+    cy = (row + y_cell) / s
+    return th.stack([cx, cy, w, h])
 
 
 def extract_best_pred_box(det_pred, B=2):

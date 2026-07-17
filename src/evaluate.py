@@ -92,6 +92,7 @@ def main():
     parser.add_argument("--n-val-persons", type=int, default=5)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--test-frac", type=float, default=0.1)
+    parser.add_argument("--val-person", type=str, default="")
     parser.add_argument("--iou-thresh", type=float, default=0.5)
     # For an EXTERNAL test set: use every person in --data-root, no splitting
     parser.add_argument("--all-data", action="store_true")
@@ -116,6 +117,7 @@ def main():
             num_workers=args.num_workers,
             val_frac=args.val_frac,
             test_frac=args.test_frac,
+            val_person=args.val_person or None,
         )
 
     model = YOLOv1(in_channels=4, split_size=S, num_boxes=B, num_classes=C).to(device)

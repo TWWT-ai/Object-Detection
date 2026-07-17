@@ -5,7 +5,8 @@ from pathlib import Path
 import torch as th
 import torch.nn.functional as F
 
-from dataloader import get_dataLoaders
+from torch.utils.data import DataLoader
+from dataloader import get_dataLoaders, HandGestureDataset
 from loss import YOLOLoss
 from model import YOLOv1
 
@@ -100,6 +101,11 @@ def main():
     parser.add_argument("--n-val-persons", type=int, default=5)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--test-frac", type=float, default=0.1)
+    # Name a specific person for validation: train on everyone else, no test
+    parser.add_argument("--val-person", type=str, default="")
+    # Validate on a DIFFERENT dataset folder (all persons in it). Overrides
+    # the val split carved from --data-root.
+    parser.add_argument("--val-root", type=str, default="")
     parser.add_argument("--out-dir", type=str, default="weights/")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=15)
@@ -117,7 +123,15 @@ def main():
         num_workers=args.num_workers,
         val_frac=args.val_frac,
         test_frac=args.test_frac,
+        val_person=args.val_person or None,
     )
+
+    # Cross-dataset validation: train on --data-root, validate on --val-root
+    if args.val_root:
+        val_ds = HandGestureDataset(args.val_root, person_ids=None, augment=False, use_depth=True)
+        validation_loader = DataLoader(val_ds, args.batch_size, shuffle=False,
+                                       num_workers=args.num_workers, pin_memory=True)
+        print(f"External val root: {args.val_root} ({len(val_ds)} images, all persons)")
 
     # C=20 is required by the hard-coded indices in the supplied YOLOLoss.
     model = YOLOv1(

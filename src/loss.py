@@ -26,8 +26,13 @@ class YOLOLoss(nn.Module):
         confidence_2_index = self.C + 5
         box_2_start = self.C + 6
 
+        # Sigmoid bounds the predicted x,y offsets to (0,1) — the same range
+        # as the cell-relative targets (YOLOv2's stability fix). w,h stay raw
+        # (handled by the sign-sqrt trick below).
         box_1 = predictions[..., box_1_start:box_1_start + 4]
+        box_1 = th.cat([th.sigmoid(box_1[..., :2]), box_1[..., 2:]], dim=-1)
         box_2 = predictions[..., box_2_start:box_2_start + 4]
+        box_2 = th.cat([th.sigmoid(box_2[..., :2]), box_2[..., 2:]], dim=-1)
         target_box = target[..., box_1_start:box_1_start + 4]
 
         iou_box_1 = compute_intersection_over_union(box_1, target_box)
