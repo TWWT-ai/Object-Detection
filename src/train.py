@@ -1,123 +1,148 @@
-"""Training script: python -m src.train [--data data] [--epochs 60]
+"""
+Main file for training Yolo model on Pascal VOC dataset
 
-Trains the multi-task YOLOv1 model and saves the checkpoint with the best
-validation box IoU (box IoU is chosen as the model-selection metric because
-localisation is the hardest of the three tasks on this tiny dataset —
-classification saturates early and would not discriminate between checkpoints).
 """
 
-import argparse                      # command-line arguments
-import random                        # seeding
-import numpy as np                   # seeding + metric math
-import torch                         # everything ML
-from torch.utils.data import DataLoader  # batching
+import torch
+import torchvision.transforms as transforms
+import torch.optim as optim
+import torchvision.transforms.functional as FT
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from model import Yolov1
+from dataset import VOCDataset
+from utils import (
+    non_max_suppression,
+    mean_average_precision,
+    intersection_over_union,
+    cellboxes_to_boxes,
+    get_bboxes,
+    plot_image,
+    save_checkpoint,
+    load_checkpoint,
+)
+from loss import YoloLoss
 
-from . import config                                              # hyper-parameters
-from .dataset import GestureDataset, scan_dataset, split_per_class  # data pipeline
-from .loss import YoloV1Loss, seg_loss                            # the two losses
-from .model import YoloV1Gesture                                  # the network
-from .utils import decode_predictions, iou_xyxy                   # evaluation helpers
+seed = 123
+torch.manual_seed(seed)
+
+# Hyperparameters etc. 
+LEARNING_RATE = 2e-5
+DEVICE = "cuda" if torch.cuda.is_available else "cpu"
+BATCH_SIZE = 16 # 64 in original paper but I don't have that much vram, grad accum?
+WEIGHT_DECAY = 0
+EPOCHS = 1000
+NUM_WORKERS = 2
+PIN_MEMORY = True
+LOAD_MODEL = False
+LOAD_MODEL_FILE = "overfit.pth.tar"
+IMG_DIR = "data/images"
+LABEL_DIR = "data/labels"
 
 
-def set_seed(seed):
-    """Seed every RNG so runs are reproducible (essential when comparing changes)."""
-    random.seed(seed)                 # python RNG (used by the augmentations + split)
-    np.random.seed(seed)              # numpy RNG
-    torch.manual_seed(seed)           # torch CPU RNG
-    torch.cuda.manual_seed_all(seed)  # torch GPU RNG
+class Compose(object):
+    def __init__(self, transforms):
+        self.transforms = transforms
+
+    def __call__(self, img, bboxes):
+        for t in self.transforms:
+            img, bboxes = t(img), bboxes
+
+        return img, bboxes
 
 
-@torch.no_grad()                      # evaluation never needs gradients -> saves memory/time
-def evaluate(model, loader, det_criterion):
-    """Return (val loss, class accuracy, mean box IoU, mean mask IoU) on a loader."""
-    model.eval()                                                   # switch off dropout/BN updates
-    tot_loss, n_img = 0.0, 0                                       # running sums
-    correct, box_ious, mask_ious = 0, [], []
-    for img, target, mask in loader:                               # iterate validation batches
-        img = img.to(config.DEVICE)                                # move to GPU
-        target = target.to(config.DEVICE)
-        mask = mask.to(config.DEVICE)
-        det, seg = model(img)                                      # forward pass
-        loss = det_criterion(det, target) + config.LAMBDA_SEG * seg_loss(seg, mask)
-        tot_loss += loss.item() * img.shape[0]                     # de-average for correct mean later
-        prob = torch.sigmoid(seg)                                  # mask probabilities
-        for k in range(img.shape[0]):                              # per-image metrics
-            n_img += 1
-            cls_pred, _, box_pred = decode_predictions(            # best predicted box + class
-                det[k].cpu(), config.S, config.B, config.C, config.IMG_SIZE)
-            obj = (target[k, ..., 4] > 0.5).nonzero(as_tuple=False)[0]  # the single GT cell (i,j)
-            i, j = int(obj[0]), int(obj[1])
-            tcell = target[k, i, j]                                # GT vector in that cell
-            cls_gt = int(tcell[5:].argmax())                       # GT class from the one-hot part
-            cx = (j + float(tcell[0])) / config.S * config.IMG_SIZE  # decode GT box back to pixels
-            cy = (i + float(tcell[1])) / config.S * config.IMG_SIZE  # (same maths as the encoder,
-            bw = float(tcell[2]) * config.IMG_SIZE                   # inverted)
-            bh = float(tcell[3]) * config.IMG_SIZE
-            box_gt = [cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2]
-            correct += int(cls_pred == cls_gt)                     # classification accuracy count
-            box_ious.append(iou_xyxy(box_pred, box_gt))            # localisation quality
-            pm = (prob[k, 0] > 0.5).float()                        # binarise the predicted mask
-            gm = mask[k, 0]                                        # GT mask
-            inter = (pm * gm).sum().item()                         # mask IoU numerator
-            union = pm.sum().item() + gm.sum().item() - inter      # mask IoU denominator
-            mask_ious.append(inter / union if union > 0 else 1.0)  # both empty -> perfect match
-    return (tot_loss / max(n_img, 1), correct / max(n_img, 1),
-            float(np.mean(box_ious)), float(np.mean(mask_ious)))
+transform = Compose([transforms.Resize((448, 448)), transforms.ToTensor(),])
+
+
+def train_fn(train_loader, model, optimizer, loss_fn):
+    loop = tqdm(train_loader, leave=True)
+    mean_loss = []
+
+    for batch_idx, (x, y) in enumerate(loop):
+        x, y = x.to(DEVICE), y.to(DEVICE)
+        out = model(x)
+        loss = loss_fn(out, y)
+        mean_loss.append(loss.item())
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # update progress bar
+        loop.set_postfix(loss=loss.item())
+
+    print(f"Mean loss was {sum(mean_loss)/len(mean_loss)}")
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data', default=config.DATA_ROOT)        # dataset root folder
-    parser.add_argument('--epochs', type=int, default=config.EPOCHS)
-    args = parser.parse_args()
+    model = Yolov1(split_size=7, num_boxes=2, num_classes=20).to(DEVICE)
+    optimizer = optim.Adam(
+        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+    loss_fn = YoloLoss()
 
-    set_seed(config.SEED)                                          # reproducibility first
-    samples, class_names = scan_dataset(args.data)                 # find all rgb/annotation pairs
-    print(f'Found {len(samples)} samples, classes: {class_names}')
-    train_idx, val_idx = split_per_class(samples, config.VAL_FRACTION, config.SEED)
-    train_ds = GestureDataset(samples, train_idx, augment=True)    # training set WITH augmentation
-    val_ds = GestureDataset(samples, val_idx, augment=False)       # val set WITHOUT (deterministic eval)
-    train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True,
-                              num_workers=2, pin_memory=True)      # shuffle: decorrelate batches
-    val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False,
-                            num_workers=2, pin_memory=True)
+    if LOAD_MODEL:
+        load_checkpoint(torch.load(LOAD_MODEL_FILE), model, optimizer)
 
-    model = YoloV1Gesture().to(config.DEVICE)                      # build + move the network
-    det_criterion = YoloV1Loss()                                   # YOLOv1 detection loss
-    # AdamW instead of the paper's SGD + hand-tuned LR schedule: AdamW adapts per-parameter
-    # step sizes, which converges much faster on small datasets and needs no warmup tuning.
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LR,
-                                  weight_decay=config.WEIGHT_DECAY)
-    # cosine annealing smoothly decays the LR to ~0 — a simple, schedule that avoids
-    # picking manual step milestones for an unknown dataset.
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    train_dataset = VOCDataset(
+        "data/100examples.csv",
+        transform=transform,
+        img_dir=IMG_DIR,
+        label_dir=LABEL_DIR,
+    )
 
-    best_iou = 0.0                                                 # best val box IoU so far
-    for epoch in range(1, args.epochs + 1):
-        model.train()                                              # enable BN updates / augment path
-        running = 0.0
-        for img, target, mask in train_loader:                     # one pass over the training set
-            img = img.to(config.DEVICE)
-            target = target.to(config.DEVICE)
-            mask = mask.to(config.DEVICE)
-            det, seg = model(img)                                  # forward
-            loss = det_criterion(det, target) + config.LAMBDA_SEG * seg_loss(seg, mask)
-            optimizer.zero_grad()                                  # clear old gradients
-            loss.backward()                                        # backprop through both heads
-            optimizer.step()                                       # update weights
-            running += loss.item() * img.shape[0]
-        scheduler.step()                                           # decay the learning rate
-        val_loss, acc, biou, miou = evaluate(model, val_loader, det_criterion)
-        print(f'epoch {epoch:3d} | train {running / len(train_ds):.3f} | '
-              f'val {val_loss:.3f} | acc {acc:.2f} | box IoU {biou:.3f} | mask IoU {miou:.3f}')
-        if biou > best_iou:                                        # keep only the best checkpoint
-            best_iou = biou
-            torch.save({'model': model.state_dict(),               # weights
-                        'classes': class_names},                   # class names travel with the model
-                       config.CHECKPOINT)
-            print(f'  saved new best (box IoU {biou:.3f})')
-    print(f'Done. Best val box IoU: {best_iou:.3f} -> {config.CHECKPOINT}')
+    test_dataset = VOCDataset(
+        "data/test.csv", transform=transform, img_dir=IMG_DIR, label_dir=LABEL_DIR,
+    )
+
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+        shuffle=True,
+        drop_last=True,
+    )
+
+    test_loader = DataLoader(
+        dataset=test_dataset,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+        shuffle=True,
+        drop_last=True,
+    )
+
+    for epoch in range(EPOCHS):
+        # for x, y in train_loader:
+        #    x = x.to(DEVICE)
+        #    for idx in range(8):
+        #        bboxes = cellboxes_to_boxes(model(x))
+        #        bboxes = non_max_suppression(bboxes[idx], iou_threshold=0.5, threshold=0.4, box_format="midpoint")
+        #        plot_image(x[idx].permute(1,2,0).to("cpu"), bboxes)
+
+        #    import sys
+        #    sys.exit()
+
+        pred_boxes, target_boxes = get_bboxes(
+            train_loader, model, iou_threshold=0.5, threshold=0.4
+        )
+
+        mean_avg_prec = mean_average_precision(
+            pred_boxes, target_boxes, iou_threshold=0.5, box_format="midpoint"
+        )
+        print(f"Train mAP: {mean_avg_prec}")
+
+        #if mean_avg_prec > 0.9:
+        #    checkpoint = {
+        #        "state_dict": model.state_dict(),
+        #        "optimizer": optimizer.state_dict(),
+        #    }
+        #    save_checkpoint(checkpoint, filename=LOAD_MODEL_FILE)
+        #    import time
+        #    time.sleep(10)
+
+        train_fn(train_loader, model, optimizer, loss_fn)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

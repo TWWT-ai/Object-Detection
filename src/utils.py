@@ -1,157 +1,349 @@
-"""Shared helpers: annotation loading (format-adaptive), box math, prediction decoding.
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from collections import Counter
 
-Why format-adaptive annotation loading?  The dataset has an `annotation` folder per
-gesture, but its file format was not documented.  Instead of hard-coding one format
-(and crashing on another) we inspect the file extension and handle the three common
-cases: mask images (png/jpg/bmp), JSON (bbox or polygon points), and plain-text boxes.
-"""
-
-import json          # to parse .json annotations if that is what the dataset uses
-import os            # path handling
-import numpy as np   # all mask / box math is done in numpy (fast, no GPU needed)
-import torch         # only decode_predictions works on torch tensors
-from PIL import Image, ImageDraw  # PIL instead of OpenCV: lighter dependency, ships with Colab
-
-# extensions we treat as "the annotation is a segmentation mask image"
-IMG_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
-
-
-def digits_key(filename):
-    """Extract the digits from a filename to pair rgb/annotation files.
-
-    Why digits and not the full name?  `rgb_003.png` and `mask_003.png` share no stem,
-    but they DO share the index `003` — digits are the most robust pairing key.
+def intersection_over_union(boxes_preds, boxes_labels, box_format="midpoint"):
     """
-    stem = os.path.splitext(os.path.basename(filename))[0]          # drop dir + extension
-    digits = ''.join(ch for ch in stem if ch.isdigit())             # keep only 0-9 characters
-    return digits if digits else stem                               # fall back to the stem
+    Calculates intersection over union
 
+    Parameters:
+        boxes_preds (tensor): Predictions of Bounding Boxes (BATCH_SIZE, 4)
+        boxes_labels (tensor): Correct labels of Bounding Boxes (BATCH_SIZE, 4)
+        box_format (str): midpoint/corners, if boxes (x,y,w,h) or (x1,y1,x2,y2)
 
-def mask_to_bbox(mask):
-    """Derive a tight [x1, y1, x2, y2] box from a binary mask.
-
-    Why derive the box from the mask instead of storing boxes separately?
-    A tight box computed from the mask is ALWAYS consistent with the mask,
-    so the detection and segmentation targets can never disagree.
+    Returns:
+        tensor: Intersection over union for all examples
     """
-    ys, xs = np.nonzero(mask)                                       # coordinates of foreground pixels
-    if len(xs) == 0:                                                # empty mask (bad annotation)
-        h, w = mask.shape                                           # fall back to the full image
-        return [0, 0, w - 1, h - 1]                                 # so training never crashes
-    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]  # tight box
+
+    if box_format == "midpoint":
+        box1_x1 = boxes_preds[..., 0:1] - boxes_preds[..., 2:3] / 2
+        box1_y1 = boxes_preds[..., 1:2] - boxes_preds[..., 3:4] / 2
+        box1_x2 = boxes_preds[..., 0:1] + boxes_preds[..., 2:3] / 2
+        box1_y2 = boxes_preds[..., 1:2] + boxes_preds[..., 3:4] / 2
+        box2_x1 = boxes_labels[..., 0:1] - boxes_labels[..., 2:3] / 2
+        box2_y1 = boxes_labels[..., 1:2] - boxes_labels[..., 3:4] / 2
+        box2_x2 = boxes_labels[..., 0:1] + boxes_labels[..., 2:3] / 2
+        box2_y2 = boxes_labels[..., 1:2] + boxes_labels[..., 3:4] / 2
+
+    if box_format == "corners":
+        box1_x1 = boxes_preds[..., 0:1]
+        box1_y1 = boxes_preds[..., 1:2]
+        box1_x2 = boxes_preds[..., 2:3]
+        box1_y2 = boxes_preds[..., 3:4]  # (N, 1)
+        box2_x1 = boxes_labels[..., 0:1]
+        box2_y1 = boxes_labels[..., 1:2]
+        box2_x2 = boxes_labels[..., 2:3]
+        box2_y2 = boxes_labels[..., 3:4]
+
+    x1 = torch.max(box1_x1, box2_x1)
+    y1 = torch.max(box1_y1, box2_y1)
+    x2 = torch.min(box1_x2, box2_x2)
+    y2 = torch.min(box1_y2, box2_y2)
+
+    # .clamp(0) is for the case when they do not intersect
+    intersection = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+
+    box1_area = abs((box1_x2 - box1_x1) * (box1_y2 - box1_y1))
+    box2_area = abs((box2_x2 - box2_x1) * (box2_y2 - box2_y1))
+
+    return intersection / (box1_area + box2_area - intersection + 1e-6)
 
 
-def _find_in_json(obj, keys):
-    """Recursively search a JSON structure for the first value under any of `keys`.
-
-    Why recursive?  Annotation JSONs are often nested (e.g. {"shapes":[{"points":...}]})
-    and we do not know the exact schema, so we search the whole tree.
+def non_max_suppression(bboxes, iou_threshold, threshold, box_format="corners"):
     """
-    if isinstance(obj, dict):                                       # dict: check keys then recurse
-        for k, v in obj.items():
-            if k.lower() in keys:                                   # case-insensitive key match
-                return v
-        for v in obj.values():                                      # not found at this level -> descend
-            r = _find_in_json(v, keys)
-            if r is not None:
-                return r
-    elif isinstance(obj, list):                                     # list: recurse into every element
-        for v in obj:
-            r = _find_in_json(v, keys)
-            if r is not None:
-                return r
-    return None                                                     # nothing found in this branch
+    Does Non Max Suppression given bboxes
 
+    Parameters:
+        bboxes (list): list of lists containing all bboxes with each bboxes
+        specified as [class_pred, prob_score, x1, y1, x2, y2]
+        iou_threshold (float): threshold where predicted bboxes is correct
+        threshold (float): threshold to remove predicted bboxes (independent of IoU) 
+        box_format (str): "midpoint" or "corners" used to specify bboxes
 
-def load_annotation(path, img_hw):
-    """Return (binary mask HxW uint8, bbox [x1,y1,x2,y2] in pixels) for ANY supported format."""
-    h, w = img_hw                                                   # target size = the RGB image size
-    ext = os.path.splitext(path)[1].lower()                         # decide the parser by extension
-
-    if ext in IMG_EXTS:                                             # --- case 1: mask image ---
-        mask = np.array(Image.open(path).convert('L'))              # force single channel grayscale
-        if mask.shape != (h, w):                                    # mask size can differ from RGB
-            mask = np.array(Image.fromarray(mask).resize((w, h), Image.NEAREST))  # NEAREST keeps labels binary
-        mask = (mask > 0).astype(np.uint8)                          # any non-zero pixel = hand
-        return mask, mask_to_bbox(mask)                             # tight box straight from the mask
-
-    if ext == '.json':                                              # --- case 2: JSON annotation ---
-        with open(path) as f:
-            data = json.load(f)                                     # parse the whole document
-        pts = _find_in_json(data, {'points', 'polygon', 'segmentation', 'landmarks'})
-        if pts is not None:                                         # polygon points found
-            pts = np.array(pts, dtype=np.float32).reshape(-1, 2)    # normalise to (N,2)
-            if pts.max() <= 1.5:                                    # values look normalised (0..1)
-                pts = pts * np.array([w, h], dtype=np.float32)      # scale to pixels
-            canvas = Image.new('L', (w, h), 0)                      # blank mask
-            ImageDraw.Draw(canvas).polygon([tuple(p) for p in pts], fill=1)  # fill the polygon
-            mask = np.array(canvas, dtype=np.uint8)                 # back to numpy
-            return mask, mask_to_bbox(mask)
-        box = _find_in_json(data, {'bbox', 'box', 'rect', 'bounding_box'})
-        if box is not None:                                         # only a box found -> rectangle mask
-            b = [float(v) for v in box]
-            if max(b) <= 1.5:                                       # normalised coords -> pixels
-                b = [b[0] * w, b[1] * h, b[2] * w, b[3] * h]
-            if b[2] <= b[0] or b[3] <= b[1] or (b[0] + b[2] <= w and b[1] + b[3] <= h and b[2] < w * 0.9):
-                b = [b[0], b[1], b[0] + b[2], b[1] + b[3]]          # heuristic: treat as x,y,w,h
-            bbox = [int(max(0, b[0])), int(max(0, b[1])), int(min(w - 1, b[2])), int(min(h - 1, b[3]))]
-            mask = np.zeros((h, w), dtype=np.uint8)                 # rectangle mask is the best
-            mask[bbox[1]:bbox[3] + 1, bbox[0]:bbox[2] + 1] = 1      # segmentation proxy a box gives us
-            return mask, bbox
-        raise ValueError(f'Unrecognised JSON annotation schema: {path}')
-
-    if ext in {'.txt', '.csv'}:                                     # --- case 3: plain text box ---
-        nums = [float(t) for t in open(path).read().replace(',', ' ').split() if
-                t.replace('.', '', 1).replace('-', '', 1).isdigit()]  # grab all numbers in the file
-        if len(nums) >= 5:                                          # YOLO txt: class cx cy w h (normalised)
-            _, cx, cy, bw, bh = nums[:5]
-            bbox = [int((cx - bw / 2) * w), int((cy - bh / 2) * h),
-                    int((cx + bw / 2) * w), int((cy + bh / 2) * h)]
-        elif len(nums) == 4:                                        # bare box: assume x1 y1 x2 y2
-            bbox = [int(v) for v in nums]
-        else:
-            raise ValueError(f'Cannot parse text annotation: {path}')
-        bbox = [max(0, bbox[0]), max(0, bbox[1]), min(w - 1, bbox[2]), min(h - 1, bbox[3])]
-        mask = np.zeros((h, w), dtype=np.uint8)                     # again a rectangle mask proxy
-        mask[bbox[1]:bbox[3] + 1, bbox[0]:bbox[2] + 1] = 1
-        return mask, bbox
-
-    raise ValueError(f'Unsupported annotation format: {path}')      # fail loudly on unknown formats
-
-
-def iou_xyxy(a, b):
-    """IoU of two [x1,y1,x2,y2] boxes — the standard metric for box overlap."""
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])                     # intersection top-left
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])                     # intersection bottom-right
-    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)               # clamp: no overlap -> 0
-    inter = iw * ih                                                 # intersection area
-    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])          # area of box a
-    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])          # area of box b
-    union = area_a + area_b - inter                                 # inclusion-exclusion
-    return inter / union if union > 0 else 0.0                      # avoid division by zero
-
-
-def decode_predictions(pred, S, B, C, img_size):
-    """Turn one raw YOLO output (S,S,B*5+C) into (class_id, score, [x1,y1,x2,y2] pixels).
-
-    Why return only ONE box?  Every image in this dataset contains exactly one gesture,
-    so instead of full NMS over multi-object outputs we simply keep the single highest
-    (confidence x class-probability) box — simpler AND more accurate for this data.
+    Returns:
+        list: bboxes after performing NMS given a specific IoU threshold
     """
-    boxes = pred[..., :B * 5].reshape(S, S, B, 5)                   # split the B boxes per cell
-    cls_prob = pred[..., B * 5:]                                    # per-cell class probabilities
-    conf = boxes[..., 4]                                            # objectness confidence per box
-    best_cls_p, best_cls = cls_prob.max(dim=-1)                     # best class per cell
-    scores = conf * best_cls_p.unsqueeze(-1)                        # YOLO score = conf * class prob
-    flat = scores.flatten().argmax()                                # single best box in the image
-    i = flat // (S * B)                                             # recover the grid row
-    j = (flat % (S * B)) // B                                       # recover the grid column
-    b = flat % B                                                    # recover which of the B boxes
-    bx = boxes[i, j, b]                                             # the winning box vector
-    cx = (j + bx[0].item()) / S * img_size                          # cell-relative x -> pixel centre x
-    cy = (i + bx[1].item()) / S * img_size                          # cell-relative y -> pixel centre y
-    bw = bx[2].item() * img_size                                    # width is predicted image-relative
-    bh = bx[3].item() * img_size                                    # height is predicted image-relative
-    box = [max(0, cx - bw / 2), max(0, cy - bh / 2),                # centre format -> corner format,
-           min(img_size - 1, cx + bw / 2), min(img_size - 1, cy + bh / 2)]  # clipped to the image
-    return int(best_cls[i, j]), float(scores[i, j, b]), box         # class id, score, pixel box
+
+    assert type(bboxes) == list
+
+    bboxes = [box for box in bboxes if box[1] > threshold]
+    bboxes = sorted(bboxes, key=lambda x: x[1], reverse=True)
+    bboxes_after_nms = []
+
+    while bboxes:
+        chosen_box = bboxes.pop(0)
+
+        bboxes = [
+            box
+            for box in bboxes
+            if box[0] != chosen_box[0]
+            or intersection_over_union(
+                torch.tensor(chosen_box[2:]),
+                torch.tensor(box[2:]),
+                box_format=box_format,
+            )
+            < iou_threshold
+        ]
+
+        bboxes_after_nms.append(chosen_box)
+
+    return bboxes_after_nms
+
+
+def mean_average_precision(
+    pred_boxes, true_boxes, iou_threshold=0.5, box_format="midpoint", num_classes=20
+):
+    """
+    Calculates mean average precision 
+
+    Parameters:
+        pred_boxes (list): list of lists containing all bboxes with each bboxes
+        specified as [train_idx, class_prediction, prob_score, x1, y1, x2, y2]
+        true_boxes (list): Similar as pred_boxes except all the correct ones 
+        iou_threshold (float): threshold where predicted bboxes is correct
+        box_format (str): "midpoint" or "corners" used to specify bboxes
+        num_classes (int): number of classes
+
+    Returns:
+        float: mAP value across all classes given a specific IoU threshold 
+    """
+
+    # list storing all AP for respective classes
+    average_precisions = []
+
+    # used for numerical stability later on
+    epsilon = 1e-6
+
+    for c in range(num_classes):
+        detections = []
+        ground_truths = []
+
+        # Go through all predictions and targets,
+        # and only add the ones that belong to the
+        # current class c
+        for detection in pred_boxes:
+            if detection[1] == c:
+                detections.append(detection)
+
+        for true_box in true_boxes:
+            if true_box[1] == c:
+                ground_truths.append(true_box)
+
+        # find the amount of bboxes for each training example
+        # Counter here finds how many ground truth bboxes we get
+        # for each training example, so let's say img 0 has 3,
+        # img 1 has 5 then we will obtain a dictionary with:
+        # amount_bboxes = {0:3, 1:5}
+        amount_bboxes = Counter([gt[0] for gt in ground_truths])
+
+        # We then go through each key, val in this dictionary
+        # and convert to the following (w.r.t same example):
+        # ammount_bboxes = {0:torch.tensor[0,0,0], 1:torch.tensor[0,0,0,0,0]}
+        for key, val in amount_bboxes.items():
+            amount_bboxes[key] = torch.zeros(val)
+
+        # sort by box probabilities which is index 2
+        detections.sort(key=lambda x: x[2], reverse=True)
+        TP = torch.zeros((len(detections)))
+        FP = torch.zeros((len(detections)))
+        total_true_bboxes = len(ground_truths)
+        
+        # If none exists for this class then we can safely skip
+        if total_true_bboxes == 0:
+            continue
+
+        for detection_idx, detection in enumerate(detections):
+            # Only take out the ground_truths that have the same
+            # training idx as detection
+            ground_truth_img = [
+                bbox for bbox in ground_truths if bbox[0] == detection[0]
+            ]
+
+            num_gts = len(ground_truth_img)
+            best_iou = 0
+
+            for idx, gt in enumerate(ground_truth_img):
+                iou = intersection_over_union(
+                    torch.tensor(detection[3:]),
+                    torch.tensor(gt[3:]),
+                    box_format=box_format,
+                )
+
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = idx
+
+            if best_iou > iou_threshold:
+                # only detect ground truth detection once
+                if amount_bboxes[detection[0]][best_gt_idx] == 0:
+                    # true positive and add this bounding box to seen
+                    TP[detection_idx] = 1
+                    amount_bboxes[detection[0]][best_gt_idx] = 1
+                else:
+                    FP[detection_idx] = 1
+
+            # if IOU is lower then the detection is a false positive
+            else:
+                FP[detection_idx] = 1
+
+        TP_cumsum = torch.cumsum(TP, dim=0)
+        FP_cumsum = torch.cumsum(FP, dim=0)
+        recalls = TP_cumsum / (total_true_bboxes + epsilon)
+        precisions = torch.divide(TP_cumsum, (TP_cumsum + FP_cumsum + epsilon))
+        precisions = torch.cat((torch.tensor([1]), precisions))
+        recalls = torch.cat((torch.tensor([0]), recalls))
+        # torch.trapz for numerical integration
+        average_precisions.append(torch.trapz(precisions, recalls))
+
+    return sum(average_precisions) / len(average_precisions)
+
+
+def plot_image(image, boxes):
+    """Plots predicted bounding boxes on the image"""
+    im = np.array(image)
+    height, width, _ = im.shape
+
+    # Create figure and axes
+    fig, ax = plt.subplots(1)
+    # Display the image
+    ax.imshow(im)
+
+    # box[0] is x midpoint, box[2] is width
+    # box[1] is y midpoint, box[3] is height
+
+    # Create a Rectangle potch
+    for box in boxes:
+        box = box[2:]
+        assert len(box) == 4, "Got more values than in x, y, w, h, in a box!"
+        upper_left_x = box[0] - box[2] / 2
+        upper_left_y = box[1] - box[3] / 2
+        rect = patches.Rectangle(
+            (upper_left_x * width, upper_left_y * height),
+            box[2] * width,
+            box[3] * height,
+            linewidth=1,
+            edgecolor="r",
+            facecolor="none",
+        )
+        # Add the patch to the Axes
+        ax.add_patch(rect)
+
+    plt.show()
+
+def get_bboxes(
+    loader,
+    model,
+    iou_threshold,
+    threshold,
+    pred_format="cells",
+    box_format="midpoint",
+    device="cuda",
+):
+    all_pred_boxes = []
+    all_true_boxes = []
+
+    # make sure model is in eval before get bboxes
+    model.eval()
+    train_idx = 0
+
+    for batch_idx, (x, labels) in enumerate(loader):
+        x = x.to(device)
+        labels = labels.to(device)
+
+        with torch.no_grad():
+            predictions = model(x)
+
+        batch_size = x.shape[0]
+        true_bboxes = cellboxes_to_boxes(labels)
+        bboxes = cellboxes_to_boxes(predictions)
+
+        for idx in range(batch_size):
+            nms_boxes = non_max_suppression(
+                bboxes[idx],
+                iou_threshold=iou_threshold,
+                threshold=threshold,
+                box_format=box_format,
+            )
+
+
+            #if batch_idx == 0 and idx == 0:
+            #    plot_image(x[idx].permute(1,2,0).to("cpu"), nms_boxes)
+            #    print(nms_boxes)
+
+            for nms_box in nms_boxes:
+                all_pred_boxes.append([train_idx] + nms_box)
+
+            for box in true_bboxes[idx]:
+                # many will get converted to 0 pred
+                if box[1] > threshold:
+                    all_true_boxes.append([train_idx] + box)
+
+            train_idx += 1
+
+    model.train()
+    return all_pred_boxes, all_true_boxes
+
+
+
+def convert_cellboxes(predictions, S=7):
+    """
+    Converts bounding boxes output from Yolo with
+    an image split size of S into entire image ratios
+    rather than relative to cell ratios. Tried to do this
+    vectorized, but this resulted in quite difficult to read
+    code... Use as a black box? Or implement a more intuitive,
+    using 2 for loops iterating range(S) and convert them one
+    by one, resulting in a slower but more readable implementation.
+    """
+
+    predictions = predictions.to("cpu")
+    batch_size = predictions.shape[0]
+    predictions = predictions.reshape(batch_size, 7, 7, 30)
+    bboxes1 = predictions[..., 21:25]
+    bboxes2 = predictions[..., 26:30]
+    scores = torch.cat(
+        (predictions[..., 20].unsqueeze(0), predictions[..., 25].unsqueeze(0)), dim=0
+    )
+    best_box = scores.argmax(0).unsqueeze(-1)
+    best_boxes = bboxes1 * (1 - best_box) + best_box * bboxes2
+    cell_indices = torch.arange(7).repeat(batch_size, 7, 1).unsqueeze(-1)
+    x = 1 / S * (best_boxes[..., :1] + cell_indices)
+    y = 1 / S * (best_boxes[..., 1:2] + cell_indices.permute(0, 2, 1, 3))
+    w_y = 1 / S * best_boxes[..., 2:4]
+    converted_bboxes = torch.cat((x, y, w_y), dim=-1)
+    predicted_class = predictions[..., :20].argmax(-1).unsqueeze(-1)
+    best_confidence = torch.max(predictions[..., 20], predictions[..., 25]).unsqueeze(
+        -1
+    )
+    converted_preds = torch.cat(
+        (predicted_class, best_confidence, converted_bboxes), dim=-1
+    )
+
+    return converted_preds
+
+
+def cellboxes_to_boxes(out, S=7):
+    converted_pred = convert_cellboxes(out).reshape(out.shape[0], S * S, -1)
+    converted_pred[..., 0] = converted_pred[..., 0].long()
+    all_bboxes = []
+
+    for ex_idx in range(out.shape[0]):
+        bboxes = []
+
+        for bbox_idx in range(S * S):
+            bboxes.append([x.item() for x in converted_pred[ex_idx, bbox_idx, :]])
+        all_bboxes.append(bboxes)
+
+    return all_bboxes
+
+def save_checkpoint(state, filename="my_checkpoint.pth.tar"):
+    print("=> Saving checkpoint")
+    torch.save(state, filename)
+
+
+def load_checkpoint(checkpoint, model, optimizer):
+    print("=> Loading checkpoint")
+    model.load_state_dict(checkpoint["state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
