@@ -46,7 +46,7 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
     print(f"test persons:  {sorted(test_ids)}")
 
     # Datasets
-    train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_flip=True, use_depth=True)
+    train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_flip=False, use_depth=True)
     val_ds = HandGestureDataset(root, person_ids=val_ids, augment=False, use_depth=True)
     # No internal test persons (test_frac=0) -> reuse val as a placeholder so
     # the 3-loader interface stays intact; final scoring happens externally

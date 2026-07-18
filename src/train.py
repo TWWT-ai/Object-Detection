@@ -69,7 +69,7 @@ def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=
     return (lambda_coord * (loss_xy + loss_wh) + loss_confidence + lambda_noobj * loss_no_object) / N
 
 
-def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0):
+def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=3.0, lambda_det=1.0):
     # Computing loss function for each Head defined in models
     detection_pred, segmentation_pred, classification_pred = outputs
 
@@ -100,6 +100,7 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
               "cls": 0.0, 
               "total": 0.0
               }
+    train_correct, total_samples = 0, 0          
     
     for images, targets in loader:
         # Copying what is on CPU onto GPU (RAM to VRAM)
@@ -123,9 +124,16 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
         # Adding the loss to the training model
         for k in running:
             running[k] += parts[k]
+        
+        # Adding accuracy counter
+        pred_label = outputs[2].argmax(dim=1)
+        correct += (pred_label == targets["Label"]).sum().item()
+        total_samples += images.size(0)
 
     n = len(loader)
-    return {k: v / n for k, v in running.items()}
+    metrics = {k: v / n for k, v in running.items()}
+    metrics["cls_acc"] = correct / total_samples
+    return metrics
 
 @th.no_grad()
 def validate(model, loader, segmentation_criterion,
@@ -185,7 +193,7 @@ def main():
     parser.add_argument("--test-frac", type=float, default=0.1)
     # Checkpoint rule: cls_acc must improve AND seg/det val losses must stay
     # within (1 + best-tol) of the best they have ever been
-    parser.add_argument("--best-tol", type=float, default=0.15)
+    parser.add_argument("--best-tol", type=float, default=0.2)
     parser.add_argument("--out-dir", type=str, default="weights/")
     parser.add_argument("--seed", type=int, default=42)
     # Pack all the top argument into one
