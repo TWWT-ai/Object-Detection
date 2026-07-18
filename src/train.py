@@ -248,7 +248,7 @@ def main():
             json.dump(history, f)
 
         print(f"[{epoch:03d}/{args.epochs}] "
-              f"train {train_m['total']:.4f} "
+              f"train {train_m['total']:.4f} (train_acc {train_m['cls_acc']:.3f})  "
               f"(det {train_m['det']:.3f} | seg {train_m['seg']:.3f} | cls {train_m['cls']:.3f})  "
               f"val {val_m['total']:.4f}  cls_acc {val_m['cls_acc']:.3f}")
 
