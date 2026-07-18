@@ -69,20 +69,31 @@ def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=
     return (lambda_coord * (loss_xy + loss_wh) + loss_confidence + lambda_noobj * loss_no_object) / N
 
 
-def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=3.0, lambda_det=1.0):
+def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0):
     # Computing loss function for each Head defined in models
     detection_pred, segmentation_pred, classification_pred = outputs
 
-    # Loss per Head
-    loss_detection = yolo_detection_loss(detection_pred, targets["det"])
-    loss_segmentation = segmentation_criterion(segmentation_pred, targets["Mask"].float())
+    # Classification is trained on EVERY sample (annotated or not) -> uses all data
     loss_classification = classification_criterion(classification_pred, targets["Label"])
 
+    # Detection + segmentation only make sense where we actually have a mask/box.
+    # has_mask is a per-sample flag (1.0 = annotated, 0.0 = classification-only).
+    has_mask = targets["has_mask"].bool()
+    if has_mask.any():
+        loss_detection = yolo_detection_loss(detection_pred[has_mask], targets["det"][has_mask])
+        loss_segmentation = segmentation_criterion(segmentation_pred[has_mask],
+                                                   targets["Mask"][has_mask].float())
+    else:
+        # No annotated sample in this batch -> nothing to learn for det/seg here
+        zero = classification_pred.new_zeros(())
+        loss_detection = zero
+        loss_segmentation = zero
+
     total = lambda_det * loss_detection + lambda_seg * loss_segmentation + lambda_cls * loss_classification
-    losses = {"det": loss_detection.item(), 
-              "seg": loss_segmentation.item(),
-              "cls": loss_classification.item(), 
-              "total": total.item()
+    losses = {"det": float(loss_detection),
+              "seg": float(loss_segmentation),
+              "cls": float(loss_classification),
+              "total": float(total)
               }
     return total, losses
 
@@ -95,13 +106,13 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
                     classification_criterion, device, lambda_segmentation,
                     lambda_classification, lambda_detection=1.0):
     model.train()
-    running = {"det": 0.0, 
+    running = {"det": 0.0,
               "seg": 0.0,
-              "cls": 0.0, 
+              "cls": 0.0,
               "total": 0.0
               }
-    correct, total_samples = 0, 0          
-    
+    correct, total_samples = 0, 0          # track TRAIN classification accuracy
+
     for images, targets in loader:
         # Copying what is on CPU onto GPU (RAM to VRAM)
         images = images.to(device)
@@ -124,8 +135,8 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
         # Adding the loss to the training model
         for k in running:
             running[k] += parts[k]
-        
-        # Adding accuracy counter
+
+        # Train classification accuracy (compare against val to spot over/underfitting)
         pred_label = outputs[2].argmax(dim=1)
         correct += (pred_label == targets["Label"]).sum().item()
         total_samples += images.size(0)
@@ -193,7 +204,7 @@ def main():
     parser.add_argument("--test-frac", type=float, default=0.1)
     # Checkpoint rule: cls_acc must improve AND seg/det val losses must stay
     # within (1 + best-tol) of the best they have ever been
-    parser.add_argument("--best-tol", type=float, default=0.2)
+    parser.add_argument("--best-tol", type=float, default=0.15)
     parser.add_argument("--out-dir", type=str, default="weights/")
     parser.add_argument("--seed", type=int, default=42)
     # Pack all the top argument into one
@@ -250,7 +261,7 @@ def main():
         print(f"[{epoch:03d}/{args.epochs}] "
               f"train {train_m['total']:.4f} (train_acc {train_m['cls_acc']:.3f})  "
               f"(det {train_m['det']:.3f} | seg {train_m['seg']:.3f} | cls {train_m['cls']:.3f})  "
-              f"val {val_m['total']:.4f}  cls_acc {val_m['cls_acc']:.3f}")
+              f"val {val_m['total']:.4f}  val_acc {val_m['cls_acc']:.3f}")
 
         # Multi-task checkpoint rule (lexicographic with tolerance):
         #   primary   — val cls_acc must beat the best so far

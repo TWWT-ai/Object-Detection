@@ -12,22 +12,18 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
                     val_frac=0.1, test_frac=0.1):
     root = pathlib.Path(root)
 
-    # Merged layout: top-level folders are GESTURES (G01_call...), the person
-    # lives in the FILENAME PREFIX ("25040826_Guo__frame_005")
-    persons = sorted({p.stem.split("__")[0] for p in root.rglob("annotation/*png")})
+    # Persons come from the RGB files now (not annotation), so persons that only
+    # have un-annotated frames still show up in the split.
+    persons = sorted({p.stem.split("__")[0] for p in root.rglob("rgb/*.png")})
     if not persons:
-        raise RuntimeError(f"No annotation found under {root}")
+        raise RuntimeError(f"No rgb frames found under {root}")
 
     # Selecting people to load
     rng = np.random.default_rng(seed)
     rng.shuffle(persons)
 
     # 3-way person-level split (train/val/test) by fraction.
-    # n_val_persons is IGNORED (kept in the signature so old callers don't break).
-    # Split is by PERSON -> no leakage between splits.
     n = len(persons)
-    # test_frac=0 means "no internal test person" — used for the final all-in
-    # model when an EXTERNAL test set does the final scoring
     n_test = max(1, round(n * test_frac)) if test_frac > 0 else 0
     n_val = max(1, round(n * val_frac))
     n_val = min(n_val, n - n_test - 1)             # keep at least 1 person for train
@@ -35,7 +31,6 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
     val_ids = set(persons[n_test:n_test + n_val])
     train_ids = set(persons[n_test + n_val:])
 
-    # Smoke-test fallback: too few persons to split -> everyone plays all roles
     if len(train_ids) == 0:
         print("WARNING: too few persons for a real split, "
               "using ALL persons for train/val/test (smoke test only)")
@@ -45,14 +40,17 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
     print(f"val persons:   {sorted(val_ids)}")
     print(f"test persons:  {sorted(test_ids)}")
 
-    # Datasets
-    train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_flip=False, use_depth=True)
-    val_ds = HandGestureDataset(root, person_ids=val_ids, augment=False, use_depth=True)
-    # No internal test persons (test_frac=0) -> reuse val as a placeholder so
-    # the 3-loader interface stays intact; final scoring happens externally
-    test_ds = HandGestureDataset(root, person_ids=test_ids, augment=False, use_depth=True) if test_ids else val_ds
+    # TRAIN: use ALL frames (annotated_only=False) -> classification sees every
+    # rgb+depth image; detection/segmentation only train on the annotated ones.
+    train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_flip=True,
+                                  use_depth=True, annotated_only=False)
+    # VAL / TEST: annotated_only=True so evaluate.py (which needs boxes + masks)
+    # and the seg/det guardrail keep working on real ground truth.
+    val_ds = HandGestureDataset(root, person_ids=val_ids, augment=False,
+                                use_depth=True, annotated_only=True)
+    test_ds = HandGestureDataset(root, person_ids=test_ids, augment=False,
+                                 use_depth=True, annotated_only=True) if test_ids else val_ds
 
-    # Loading Data
     train_loader = DataLoader(train_ds, batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
@@ -61,55 +59,68 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
 
 
 class HandGestureDataset():
-    def __init__(self, root, person_ids=None, transform=None, augment=False, use_flip=False, use_depth=False):
+    def __init__(self, root, person_ids=None, transform=None, augment=False, use_flip=False,
+                 use_depth=False, annotated_only=True):
         self.root = pathlib.Path(root)
         self.transform = transform
         self.augment = augment
         self.use_flip = use_flip
         self.use_depth = use_depth
+        # annotated_only=True  -> classic behaviour: only frames that have a mask
+        # annotated_only=False -> use EVERY rgb frame; mask may be None
+        self.annotated_only = annotated_only
         self.samples = []
         self.skipped = 0
+        self.n_annotated = 0
+        self.n_unannotated = 0
         self.IMAGE_SIZE = 448
 
-        for mask_path in sorted(self.root.rglob("annotation/*png")):
-            # Breaking down path and folder
-            clip_directory = mask_path.parent.parent
-            gesture_directory = clip_directory.parent
+        # Enumerate over RGB frames (not annotations) so un-annotated frames are included
+        for rgb_path in sorted(self.root.rglob("rgb/*.png")):
+            clip_directory = rgb_path.parent.parent      # .../Gxx/clipYY
+            gesture_directory = clip_directory.parent    # .../Gxx
 
-            # Merged layout: person is the filename prefix, not a folder
-            stem = mask_path.stem                 # e.g. 25040826_Guo__frame_005
-            person_id = stem.split("__")[0]       # 25040826_Guo
+            stem = rgb_path.stem                          # e.g. 25040826_Guo__frame_005
+            person_id = stem.split("__")[0]               # 25040826_Guo
 
-            # If the person is not in the list then pass
+            # If the person is not in this split, skip
             if person_ids is not None and person_id not in person_ids:
                 continue
 
-            # Finding the index of the gesture
+            # Gesture label from the folder name, e.g. "G01_call" -> 0
             label = int(gesture_directory.name[1:3]) - 1
 
-            # One folder holds many people's frame_005, so frame number alone is
-            # NOT unique -> match by the FULL stem (merge renamed rgb/depth/
-            # annotation to identical stems)
-            rgb_path = self._find_by_stem(clip_directory / "rgb", stem)
+            # Depth is REQUIRED (the model always takes a depth channel)
             depth_path = self._find_by_stem(clip_directory / "depth", stem)
-
-            # Skip (and count) incomplete samples instead of crashing:
-            # one classmate's missing file should not block the whole cohort
-            if rgb_path is None or depth_path is None:
+            if depth_path is None:
                 self.skipped += 1
                 continue
 
-            # Adding into the samples
+            # Mask is OPTIONAL now
+            mask_path = self._find_by_stem(clip_directory / "annotation", stem)
+
+            # If we only want annotated frames, skip the ones without a mask
+            if self.annotated_only and mask_path is None:
+                continue
+
+            if mask_path is None:
+                self.n_unannotated += 1
+            else:
+                self.n_annotated += 1
+
             self.samples.append({
                 "RGB": rgb_path,
                 "Depth": depth_path,
-                "Mask": mask_path,
+                "Mask": mask_path,          # may be None
                 "Label": label,
                 "Person": person_id
             })
 
         if self.skipped:
-            print(f"WARNING: skipped {self.skipped} annotation(s) with no matching rgb/depth file")
+            print(f"WARNING: skipped {self.skipped} rgb frame(s) with no matching depth file")
+
+        print(f"Dataset built: {len(self.samples)} samples "
+              f"({self.n_annotated} annotated + {self.n_unannotated} unannotated)")
 
         if len(self.samples) == 0:
             raise RuntimeError(f"No File found in this root: {self.root}")
@@ -128,30 +139,34 @@ class HandGestureDataset():
         return len(self.samples)
 
     def __getitem__(self, index):
-        # Read file at position index
         s = self.samples[index]
 
         # 1. RGB into numpy
         rgb = np.array(Image.open(s["RGB"]).convert("RGB"))
 
-        # 2. Depth into numpy — classmates exported different formats
+        # 2. Depth into numpy
         if s["Depth"].suffix == ".npy":
             depth = np.load(s["Depth"]).astype(np.float32)
         else:
             depth = cv2.imread(str(s["Depth"]), cv2.IMREAD_UNCHANGED).astype(np.float32)
         if depth.ndim == 3:
-            depth = depth[..., 0]      # some exports save depth as 3-channel
+            depth = depth[..., 0]
 
-        # 3. Mask into binary mask
-        mask = np.array(Image.open(s["Mask"]).convert("L"))  # "L" means grey scale (0 - 255)
-        mask = (mask > 127).astype(np.float32)               # separating hand (> 127) and background
+        # 3. Mask into binary mask -- OR an all-zero placeholder if there is none
+        if s["Mask"] is not None:
+            mask = np.array(Image.open(s["Mask"]).convert("L"))
+            mask = (mask > 127).astype(np.float32)
+            has_mask = 1.0
+        else:
+            mask = np.zeros((rgb.shape[0], rgb.shape[1]), dtype=np.float32)
+            has_mask = 0.0
 
-        # Resizing all three images, image size is (width, height)
+        # Resizing all three
         rgb = cv2.resize(rgb, (self.IMAGE_SIZE, self.IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
         depth = cv2.resize(depth, (self.IMAGE_SIZE, self.IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, (self.IMAGE_SIZE, self.IMAGE_SIZE), interpolation=cv2.INTER_NEAREST)
 
-        # Augmentation preventing overfitting forced to train
+        # Augmentation
         if self.augment:
             # Horizontal flip
             if self.use_flip and np.random.rand() < 0.5:
@@ -159,14 +174,12 @@ class HandGestureDataset():
                 depth = depth[:, ::-1].copy()
                 mask = mask[:, ::-1].copy()
 
-            # Adjusting brightness (wide range for cross-person lighting robustness)
+            # Brightness
             if np.random.rand() < 0.5:
                 factor = np.random.uniform(0.5, 1.5)
                 rgb = np.clip(rgb.astype(np.float32) * factor, 0, 255).astype(np.uint8)
 
-            # Random shift + scale: hand position/size changes every epoch, so
-            # "recognize the background" stops working as a shortcut.
-            # rgb / depth / mask MUST get the same transform.
+            # Random shift + scale
             if np.random.rand() < 0.5:
                 scale = np.random.uniform(0.9, 1.2)
                 tx = np.random.uniform(-0.08, 0.08) * self.IMAGE_SIZE
@@ -175,56 +188,54 @@ class HandGestureDataset():
                 size = (self.IMAGE_SIZE, self.IMAGE_SIZE)
                 rgb_a = cv2.warpAffine(rgb, M, size, flags=cv2.INTER_LINEAR)
                 depth_a = cv2.warpAffine(depth, M, size, flags=cv2.INTER_LINEAR)
-                # NEAREST for the mask: 0/1 labels must not be blended into 0.5
                 mask_a = cv2.warpAffine(mask, M, size, flags=cv2.INTER_NEAREST)
-                if mask_a.sum() > 0:      # keep only if the hand stayed in frame
+                # For annotated frames keep the transform only if the hand stayed in frame.
+                # For un-annotated frames there is no hand-in-frame constraint.
+                if has_mask == 0.0 or mask_a.sum() > 0:
                     rgb, depth, mask = rgb_a, depth_a, mask_a
 
-        # Measuring the boundary box AFTER augmentation, so the box follows
-        # whatever geometric transform was applied above
-        rows, cols = np.where(mask == 1)
-        if len(rows) == 0:
-            raise ValueError(f"The mask is empty: {s['Mask']}")
-
-        # x_min, y_min, x_max, y_max
-        boundary_box = np.array([cols.min(), rows.min(), cols.max(), rows.max()], dtype=np.float32)
-        # Normalizing and simplifying steps for YOLO encoding later
-        boundary_box = boundary_box / self.IMAGE_SIZE
-
-        # Corner box -> S x S x 5 YOLO grid, the format the loss expects
-        det_target = encode_yolo_target(boundary_box)
+        # Build the detection + segmentation targets.
+        # Only annotated frames get a real box; un-annotated frames get a dummy
+        # target that the loss will IGNORE (via has_mask).
+        if has_mask == 1.0:
+            rows, cols = np.where(mask == 1)
+            if len(rows) == 0:
+                # Mask got augmented out of frame -> treat this frame as unannotated
+                has_mask = 0.0
+                det_target = th.zeros(7, 7, 5)
+            else:
+                boundary_box = np.array([cols.min(), rows.min(), cols.max(), rows.max()],
+                                        dtype=np.float32) / self.IMAGE_SIZE
+                det_target = encode_yolo_target(boundary_box)
+        else:
+            det_target = th.zeros(7, 7, 5)
 
         # Normalizing RGB
         rgb = rgb.astype(np.float32) / 255.0
 
-        # Imputation with median
+        # Depth imputation + normalization
         valid = depth > 0
         if valid.any():
             depth[~valid] = np.median(depth[valid])
-
-        # Normalizing depth: the cohort exported 8-bit depth maps (0-255),
-        # keep a fallback for true 16-bit millimetre depth just in case
         if depth.max() > 255:
             depth = np.clip(depth, 0, 1500) / 1500.0
         else:
             depth = depth / 255.0
 
-        # Transforming it into 3D matrix to match RGB
-        # Then having a matrix with info of [R, G, B, depth]
+        # Stack RGB + depth -> 4 channels
         if self.use_depth:
             image = np.concatenate([rgb, depth[..., None]], axis=-1)
         else:
             image = rgb
 
-        # Packing into what pytorch would expect
-        # permute() converts into [channel, height, width], what nn.Conv2d expects
         image = th.from_numpy(image).permute(2, 0, 1).float()
         mask = th.from_numpy(mask).unsqueeze(0).float()
 
-        # Keys must match compute_loss in train.py exactly: "det", "Mask", "Label"
         targets = {"det": det_target,
                    "Mask": mask,
-                   "Label": th.tensor(s["Label"], dtype=th.long)
+                   "Label": th.tensor(s["Label"], dtype=th.long),
+                   # 1.0 = has a real box+mask, 0.0 = classification-only sample
+                   "has_mask": th.tensor(has_mask, dtype=th.float32)
                    }
 
         return image, targets
