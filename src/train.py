@@ -100,7 +100,7 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
               "cls": 0.0, 
               "total": 0.0
               }
-    train_correct, total_samples = 0, 0          
+    correct, total_samples = 0, 0          
     
     for images, targets in loader:
         # Copying what is on CPU onto GPU (RAM to VRAM)
