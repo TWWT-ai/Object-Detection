@@ -61,7 +61,7 @@ class ClassificationHead(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(2048, 256),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),
             nn.Linear(256, n_classes),
         )
 
