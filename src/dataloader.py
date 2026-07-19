@@ -174,52 +174,25 @@ class HandGestureDataset():
                 depth = depth[:, ::-1].copy()
                 mask = mask[:, ::-1].copy()
 
-            # --- Geometric: rotation (+/-15) + scale + translation ---
-            # applied identically to rgb / depth / mask so the box still lines up
-            if np.random.rand() < 0.7:
-                angle = np.random.uniform(-15, 15)          # NEW: small rotation
+            # Brightness
+            if np.random.rand() < 0.5:
+                factor = np.random.uniform(0.5, 1.5)
+                rgb = np.clip(rgb.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+
+            # Random shift + scale
+            if np.random.rand() < 0.5:
                 scale = np.random.uniform(0.9, 1.2)
-                center = (self.IMAGE_SIZE / 2, self.IMAGE_SIZE / 2)
-                M = cv2.getRotationMatrix2D(center, angle, scale)   # rotation + scale
-                M[0, 2] += np.random.uniform(-0.08, 0.08) * self.IMAGE_SIZE   # + tx
-                M[1, 2] += np.random.uniform(-0.08, 0.08) * self.IMAGE_SIZE   # + ty
+                tx = np.random.uniform(-0.08, 0.08) * self.IMAGE_SIZE
+                ty = np.random.uniform(-0.08, 0.08) * self.IMAGE_SIZE
+                M = np.float32([[scale, 0, tx], [0, scale, ty]])
                 size = (self.IMAGE_SIZE, self.IMAGE_SIZE)
                 rgb_a = cv2.warpAffine(rgb, M, size, flags=cv2.INTER_LINEAR)
                 depth_a = cv2.warpAffine(depth, M, size, flags=cv2.INTER_LINEAR)
-                # NEAREST for the mask: 0/1 labels must not be blended into 0.5
                 mask_a = cv2.warpAffine(mask, M, size, flags=cv2.INTER_NEAREST)
                 # For annotated frames keep the transform only if the hand stayed in frame.
                 # For un-annotated frames there is no hand-in-frame constraint.
                 if has_mask == 0.0 or mask_a.sum() > 0:
                     rgb, depth, mask = rgb_a, depth_a, mask_a
-
-            # --- Photometric on RGB only: brightness + contrast ---
-            if np.random.rand() < 0.5:
-                brightness = np.random.uniform(0.6, 1.4)
-                contrast = np.random.uniform(0.7, 1.3)
-                rgb = rgb.astype(np.float32) * brightness
-                m = rgb.mean()
-                rgb = (rgb - m) * contrast + m
-                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-
-            # --- Light Gaussian noise on RGB ---
-            if np.random.rand() < 0.3:
-                noise = np.random.normal(0, 8, rgb.shape)      # std ~8 on the 0-255 scale
-                rgb = np.clip(rgb.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
-            # --- Random erasing / cutout on RGB (mask untouched -> label still valid) ---
-            if np.random.rand() < 0.3:
-                area = self.IMAGE_SIZE * self.IMAGE_SIZE
-                for _ in range(10):                            # try a few times to fit a box
-                    er = np.random.uniform(0.02, 0.15) * area
-                    ar = np.random.uniform(0.3, 3.3)           # aspect ratio
-                    h = int(round((er * ar) ** 0.5))
-                    w = int(round((er / ar) ** 0.5))
-                    if 0 < h < self.IMAGE_SIZE and 0 < w < self.IMAGE_SIZE:
-                        y0 = np.random.randint(0, self.IMAGE_SIZE - h)
-                        x0 = np.random.randint(0, self.IMAGE_SIZE - w)
-                        rgb[y0:y0 + h, x0:x0 + w] = np.random.randint(0, 256, (h, w, 3), dtype=np.uint8)
-                        break
 
         # Build the detection + segmentation targets.
         # Only annotated frames get a real box; un-annotated frames get a dummy
