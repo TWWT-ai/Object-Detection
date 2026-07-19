@@ -42,7 +42,7 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
 
     # TRAIN: use ALL frames (annotated_only=False) -> classification sees every
     # rgb+depth image; detection/segmentation only train on the annotated ones.
-    train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_flip=True,
+    train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_flip=False,
                                   use_depth=True, annotated_only=False)
     # VAL / TEST: annotated_only=True so evaluate.py (which needs boxes + masks)
     # and the seg/det guardrail keep working on real ground truth.
