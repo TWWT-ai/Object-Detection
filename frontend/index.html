@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hand Gesture Demo</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  :root{--bg:#0f1117;--card:#1a1d27;--ink:#e8eaf0;--muted:#9aa0b0;--accent:#4da3ff;--line:#2b3040}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC",sans-serif}
+  .wrap{max-width:960px;margin:0 auto;padding:40px 20px}
+  h1{font-size:24px;margin:0 0 4px}
+  .sub{color:var(--muted);margin:0 0 24px;font-size:14px}
+  .tabs{display:flex;gap:8px;margin-bottom:16px}
+  .tab{padding:9px 18px;border-radius:9px;border:1px solid var(--line);cursor:pointer;
+       font-size:14px;background:var(--card);color:var(--muted)}
+  .tab.active{background:var(--accent);color:#04101f;font-weight:600;border-color:var(--accent)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;margin-bottom:18px}
+  .drop{border:2px dashed var(--line);border-radius:12px;padding:34px;text-align:center;cursor:pointer;transition:.15s}
+  .drop:hover{border-color:var(--accent);background:rgba(77,163,255,.05)}
+  .drop input{display:none}
+  button{background:var(--accent);color:#04101f;border:none;border-radius:9px;padding:10px 18px;
+         font-weight:600;font-size:14px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  button.stop{background:#f87171;color:#2a0707}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:680px){.row{grid-template-columns:1fr}}
+  img.preview,video.preview{width:100%;border-radius:10px;display:block;background:#000}
+  .label{font-size:26px;font-weight:700;text-transform:capitalize}
+  .bar{height:8px;background:var(--line);border-radius:6px;overflow:hidden;margin-top:8px}
+  .bar > div{height:100%;background:var(--accent);transition:width .2s}
+  .muted{color:var(--muted);font-size:13px}
+  .fps{font-size:12px;color:var(--muted);margin-top:6px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect } = React;
+
+// ---------------- Upload mode ----------------
+function UploadMode() {
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const inputRef = useRef();
+
+  function pick(f) {
+    if (!f) return;
+    setFile(f); setResult(null); setError(null);
+    setPreview(URL.createObjectURL(f));
+  }
+
+  async function predict() {
+    if (!file) return;
+    setLoading(true); setError(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch("/predict", { method: "POST", body: fd });
+      if (!res.ok) throw new Error("Server error " + res.status);
+      setResult(await res.json());
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  }
+
+  return (
+    <div>
+      <div className="card">
+        <div className="drop" onClick={() => inputRef.current.click()}
+             onDrop={e => { e.preventDefault(); pick(e.dataTransfer.files[0]); }}
+             onDragOver={e => e.preventDefault()}>
+          <input ref={inputRef} type="file" accept="image/*"
+                 onChange={e => pick(e.target.files[0])} />
+          {preview
+            ? <img className="preview" src={preview} alt="preview" style={{maxHeight:280,width:"auto",margin:"0 auto"}}/>
+            : <div className="muted">点击或拖拽图片到这里</div>}
+        </div>
+        <div style={{marginTop:16}}>
+          <button onClick={predict} disabled={!file || loading}>
+            {loading ? "识别中…" : "识别 Predict"}
+          </button>
+        </div>
+        {error && <p style={{color:"#f87171",marginTop:12}}>⚠ {error}</p>}
+      </div>
+
+      {result && (
+        <div className="card">
+          <div className="row">
+            <div>
+              <div className="muted" style={{marginBottom:8}}>预测结果</div>
+              <img className="preview" src={result.image} alt="result" />
+            </div>
+            <div>
+              <div className="muted">手势 Gesture</div>
+              <div className="label">{result.label}</div>
+              <div className="bar"><div style={{width:(result.confidence*100)+"%"}}/></div>
+              <div className="muted" style={{marginTop:6}}>置信度 {(result.confidence*100).toFixed(1)}%</div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------- Live camera mode ----------------
+function CameraMode() {
+  const videoRef  = useRef(null);
+  const canvasRef = useRef(null);
+  const streamRef = useRef(null);
+  const runningRef = useRef(false);   // ref, not state: the loop reads it live
+  const [running, setRunning] = useState(false);
+  const [result, setResult]   = useState(null);
+  const [error, setError]     = useState(null);
+  const [fps, setFps]         = useState(0);
+
+  async function start() {
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480 }, audio: false
+      });
+      streamRef.current = stream;
+      videoRef.current.srcObject = stream;
+      await videoRef.current.play();
+      runningRef.current = true;
+      setRunning(true);
+      loop();                          // start the send-frame loop
+    } catch (e) {
+      setError("无法打开摄像头: " + e.message + "（需要允许权限，且必须是 localhost 或 https）");
+    }
+  }
+
+  function stop() {
+    runningRef.current = false;
+    setRunning(false);
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+  }
+
+  // Send frames one-at-a-time: wait for the previous response before grabbing
+  // the next frame, so a slow model never piles up requests.
+  async function loop() {
+    const video = videoRef.current, canvas = canvasRef.current;
+    while (runningRef.current) {
+      const t0 = performance.now();
+      try {
+        // draw current video frame onto a square canvas (center-crop)
+        const size = Math.min(video.videoWidth, video.videoHeight);
+        const sx = (video.videoWidth  - size) / 2;
+        const sy = (video.videoHeight - size) / 2;
+        canvas.width = 448; canvas.height = 448;
+        canvas.getContext("2d").drawImage(video, sx, sy, size, size, 0, 0, 448, 448);
+
+        const blob = await new Promise(r => canvas.toBlob(r, "image/jpeg", 0.8));
+        const fd = new FormData();
+        fd.append("file", blob, "frame.jpg");
+        const res = await fetch("/predict", { method: "POST", body: fd });
+        if (res.ok) {
+          const data = await res.json();
+          if (runningRef.current) setResult(data);
+        }
+      } catch (e) { /* one bad frame is fine, keep looping */ }
+      const dt = performance.now() - t0;
+      setFps(1000 / dt);
+      // small breather so the UI stays responsive; raise to 300-500ms if CPU is slow
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
+  useEffect(() => stop, []);           // stop camera when leaving the tab
+
+  return (
+    <div>
+      <div className="card">
+        <div style={{display:"flex", gap:10, marginBottom:14}}>
+          {!running
+            ? <button onClick={start}>📷 开启摄像头</button>
+            : <button className="stop" onClick={stop}>■ 停止</button>}
+        </div>
+        {error && <p style={{color:"#f87171"}}>⚠ {error}</p>}
+        <div className="row">
+          <div>
+            <div className="muted" style={{marginBottom:8}}>摄像头画面</div>
+            <video ref={videoRef} className="preview" muted playsInline />
+            <canvas ref={canvasRef} style={{display:"none"}} />
+          </div>
+          <div>
+            <div className="muted" style={{marginBottom:8}}>模型输出（框 + 分割 + 类别）</div>
+            {result
+              ? <img className="preview" src={result.image} alt="live result" />
+              : <div className="muted" style={{padding:"40px 0",textAlign:"center"}}>等待画面…</div>}
+          </div>
+        </div>
+        {result && (
+          <div style={{marginTop:16}}>
+            <div className="label">{result.label}</div>
+            <div className="bar"><div style={{width:(result.confidence*100)+"%"}}/></div>
+            <div className="muted" style={{marginTop:6}}>
+              置信度 {(result.confidence*100).toFixed(1)}%
+            </div>
+            <div className="fps">~{fps.toFixed(1)} 次识别/秒</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------- App shell with tabs ----------------
+function App() {
+  const [mode, setMode] = useState("upload");
+  return (
+    <div className="wrap">
+      <h1>✋ Hand Gesture Recognition</h1>
+      <p className="sub">检测框 + 手部分割 + 手势分类（当前 depth 用 0 填充，精度低于训练环境）</p>
+      <div className="tabs">
+        <div className={"tab " + (mode==="upload" ? "active" : "")} onClick={() => setMode("upload")}>🖼 上传图片</div>
+        <div className={"tab " + (mode==="camera" ? "active" : "")} onClick={() => setMode("camera")}>📷 实时摄像头</div>
+      </div>
+      {mode === "upload" ? <UploadMode/> : <CameraMode/>}
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
